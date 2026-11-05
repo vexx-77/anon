@@ -7,13 +7,15 @@ import json
 import base64
 import concurrent.futures
 from collections import OrderedDict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import telebot
 from telebot import types
 
 TOKEN = os.environ.get("TOKEN")
 CHANNEL = os.environ.get("CHANNEL")
+ADMIN_STR = os.environ.get("ADMIN")
+ADMIN = int(ADMIN_STR) if ADMIN_STR else 0
 CHANNEL_LINK = "t.me/AnonGroupChat_channel"
 
 if not TOKEN:
@@ -25,8 +27,6 @@ bot = telebot.TeleBot(TOKEN, parse_mode=None)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_DIR = os.path.join(BASE_DIR, "data")
 DB_FILE = os.path.join(DB_DIR, "users.json")
-
-FORWARD_PREFIX = "[forwarded]\n"
 
 joined_users = set()
 user_langs = {}
@@ -68,16 +68,19 @@ TEXTS = {
         'join_success': "<b>Ты зашел в чат.</b>\nСейчас тут: {count}",
         'exit_already': "<b>Ты и так не в чате.</b>\nСейчас тут: {count}",
         'exit_success': "<b>Ты вышел из чата.</b>\nСейчас тут: {count}",
-        'notify_join': "<b>[bot]</b>\nКто-то зашел в чат. Сейчас тут: {count}",
-        'notify_exit': "<b>[bot]</b>\nКто-то вышел из чата. Сейчас тут: {count}",
-        'restarted': "<b>[bot]</b>\nБот перезапущен. Ты остаешься в чате.",
+        'notify_join': "<b>[бот]</b>\nКто-то зашел в чат. Сейчас тут: {count}",
+        'notify_exit': "<b>[бот]</b>\nКто-то вышел из чата. Сейчас тут: {count}",
+        'restarted': "<b>[бот]</b>\nБот перезапущен. Ты остаешься в чате.",
         'lang_select': "Выбери язык / Select language:",
         'lang_set': "<b>Язык изменен на русский.</b>",
-        'reaction': "<b>[reaction]</b>\n+ {emoji}",
-        'online': "<b>[bot]</b>\nСейчас в сети: {count}",
-        'check_user': "<b>[bot]</b>\nЭто сообщение пользователя.",
-        'check_sys': "<b>[bot]</b>\nЭто системное сообщение бота.",
-        'stats': "Пользователей в сессии: {count}\nБот: @{botname}\n(Сообщение обновляется автоматически)\n\nUsers in session: {count}\nBot: @{botname}\n(Message updates automatically)"
+        'reaction': "<b>[реакция]</b>\n+ {emoji}",
+        'online': "<b>[бот]</b>\nСейчас в сети: {count}",
+        'check_user': "<b>[бот]</b>\nЭто сообщение пользователя.",
+        'check_sys': "<b>[бот]</b>\nЭто системное сообщение бота.",
+        'stats': "Пользователей в сессии: {count}\nБот: @{botname}\n(Сообщение обновляется автоматически)\n\nUsers in session: {count}\nBot: @{botname}\n(Message updates automatically)",
+        'forwarded': "[переслано]",
+        'edited': "[изменено]",
+        'announcement': "[объявление]"
     },
     'en': {
         'start': "<b>Anonymous Chat</b>\n\nStatus: <b>{status}</b>\n\n/join — join chat\n/exit — leave chat\n/rules — rules\n/help — help\n/lang — change language",
@@ -100,7 +103,10 @@ TEXTS = {
         'online': "<b>[bot]</b>\nCurrently online: {count}",
         'check_user': "<b>[bot]</b>\nThis is a user message.",
         'check_sys': "<b>[bot]</b>\nThis is a system message.",
-        'stats': "Пользователей в сессии: {count}\nБот: @{botname}\n(Сообщение обновляется автоматически)\n\nUsers in session: {count}\nBot: @{botname}\n(Message updates automatically)"
+        'stats': "Пользователей в сессии: {count}\nБот: @{botname}\n(Сообщение обновляется автоматически)\n\nUsers in session: {count}\nBot: @{botname}\n(Message updates automatically)",
+        'forwarded': "[forwarded]",
+        'edited': "[edited]",
+        'announcement': "[announcement]"
     }
 }
 
@@ -185,9 +191,9 @@ def is_forwarded(msg):
     if getattr(msg, 'forward_date', None): return True
     return False
 
-def prepend_forwarded(text, entities):
-    new_text = FORWARD_PREFIX + (text or '')
-    shift = utf16_len(FORWARD_PREFIX)
+def prepend_forwarded(text, entities, prefix):
+    new_text = prefix + "\n" + (text or '')
+    shift = utf16_len(prefix + "\n")
     if not entities:
         return new_text, None
     new_ents = []
@@ -200,19 +206,18 @@ def prepend_forwarded(text, entities):
         new_ents.append(ne)
     return new_text, new_ents
 
-def fit_text_with_forward(text, entities, max_len):
+def fit_text_with_forward(text, entities, max_len, prefix):
     if not text:
-        fwd = FORWARD_PREFIX.rstrip('\n')
-        return fwd, None
-    if utf16_len(text) + utf16_len(FORWARD_PREFIX) <= max_len:
-        return prepend_forwarded(text, entities)
-    avail = max_len - utf16_len(FORWARD_PREFIX)
+        return prefix, None
+    if utf16_len(text) + utf16_len(prefix) + 1 <= max_len:
+        return prepend_forwarded(text, entities, prefix)
+    avail = max_len - utf16_len(prefix) - 1
     while text and utf16_len(text) > avail:
         text = text[:-1]
     if entities:
         lim = utf16_len(text)
         entities = [e for e in entities if e.offset + e.length <= lim]
-    return prepend_forwarded(text, entities)
+    return prepend_forwarded(text, entities, prefix)
 
 def send_text_safe(uid, text, entities=None, reply_to=None, sys_msg=False, auto_del=False, lpo=None):
     try:
@@ -240,8 +245,10 @@ def send_media_task(uid, ct, msg, reply_to, fwd=False):
         try:
             caption = msg.caption or ''
             cap_ent = msg.caption_entities
+            
             if fwd:
-                caption, cap_ent = fit_text_with_forward(caption, cap_ent, MAX_CAPTION)
+                prefix = t(uid, 'forwarded')
+                caption, cap_ent = fit_text_with_forward(caption, cap_ent, MAX_CAPTION, prefix)
             else:
                 if utf16_len(caption) > MAX_CAPTION:
                     caption = caption[:MAX_CAPTION]
@@ -267,7 +274,8 @@ def send_task_wrapper(uid, ct, msg, reply_to):
         text = msg.text or ''
         ents = msg.entities
         if fwd:
-            text, ents = fit_text_with_forward(text, ents, MAX_TEXT)
+            prefix = t(uid, 'forwarded')
+            text, ents = fit_text_with_forward(text, ents, MAX_TEXT, prefix)
         
         lpo = getattr(msg, 'link_preview_options', None)
         return send_text_safe(uid, text, entities=ents, reply_to=reply_to, lpo=lpo)
@@ -277,11 +285,12 @@ def send_task_wrapper(uid, ct, msg, reply_to):
     elif ct in {'sticker', 'animation', 'voice', 'video_note'}:
         try:
             if fwd:
+                prefix = t(uid, 'forwarded')
                 if reply_to:
-                    m_hdr = send_text_safe(uid, "[forwarded]", reply_to=reply_to)
+                    m_hdr = send_text_safe(uid, prefix, reply_to=reply_to)
                     if m_hdr: reply_to = m_hdr.message_id
                 else:
-                    m_hdr = send_text_safe(uid, "[forwarded]")
+                    m_hdr = send_text_safe(uid, prefix)
                     if m_hdr: reply_to = m_hdr.message_id
             if ct == 'sticker':
                 return bot.send_sticker(uid, msg.sticker.file_id, reply_to_message_id=reply_to)
@@ -330,10 +339,47 @@ def broadcast_message(message, sender_id, parent_thread_id=None):
     except Exception:
         pass
 
-def notify_others(sender_id, text):
+def notify_others(sender_id, text_ru, text_en):
     for u in list(joined_users):
         if u != sender_id:
-            executor.submit(send_text_safe, u, text, sys_msg=True, auto_del=True)
+            txt = text_ru if user_langs.get(u, 'ru') == 'ru' else text_en
+            executor.submit(send_text_safe, u, txt, sys_msg=True, auto_del=True)
+
+@bot.message_handler(commands=['say'])
+def cmd_say(message):
+    uid = message.from_user.id
+    if uid != ADMIN: return
+    if len(message.text) <= 5: return
+    
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2: return
+    
+    offset = len(parts[0]) + 1
+    orig_text = parts[1]
+    
+    ents = []
+    if message.entities:
+        for e in message.entities:
+            if e.offset >= offset:
+                ne = types.MessageEntity(type=e.type, offset=e.offset - offset, length=e.length)
+                if getattr(e, 'url', None): ne.url = e.url
+                if getattr(e, 'user', None): ne.user = e.user
+                if getattr(e, 'language', None): ne.language = e.language
+                if getattr(e, 'custom_emoji_id', None): ne.custom_emoji_id = e.custom_emoji_id
+                ents.append(ne)
+    
+    for u in list(joined_users):
+        pfx = t(u, 'announcement') + "\n"
+        shift = utf16_len(pfx)
+        new_ents = []
+        for e in ents:
+            ne = types.MessageEntity(type=e.type, offset=e.offset + shift, length=e.length)
+            if getattr(e, 'url', None): ne.url = e.url
+            if getattr(e, 'user', None): ne.user = e.user
+            if getattr(e, 'language', None): ne.language = e.language
+            if getattr(e, 'custom_emoji_id', None): ne.custom_emoji_id = e.custom_emoji_id
+            new_ents.append(ne)
+        executor.submit(send_text_safe, u, pfx + orig_text, entities=new_ents, sys_msg=True)
 
 @bot.message_handler(commands=['lang'])
 def cmd_lang(message):
@@ -390,7 +436,7 @@ def cmd_join(message):
         joined_users.add(uid)
         save_db()
         bot.send_message(uid, t(uid, 'join_success', count=len(joined_users)), parse_mode='HTML')
-        notify_others(uid, t(uid, 'notify_join', count=len(joined_users)))
+        notify_others(uid, t(uid, 'notify_join', count=len(joined_users)), t(uid, 'notify_join', count=len(joined_users)))
 
 @bot.message_handler(commands=['exit'])
 def cmd_exit(message):
@@ -404,7 +450,7 @@ def cmd_exit(message):
         joined_users.remove(uid)
         save_db()
         bot.send_message(uid, t(uid, 'exit_success', count=len(joined_users)), parse_mode='HTML')
-        notify_others(uid, t(uid, 'notify_exit', count=len(joined_users)))
+        notify_others(uid, t(uid, 'notify_exit', count=len(joined_users)), t(uid, 'notify_exit', count=len(joined_users)))
 
 @bot.message_handler(commands=['online'])
 def cmd_online(message):
@@ -463,23 +509,28 @@ def handle_edit(message):
 
     relations = user_messages[key]
     fwd = is_forwarded(message)
+    fwd_prefix = t(uid, 'forwarded')
 
     if message.content_type == 'text':
         orig_text = message.text or ''
         ents = list(message.entities or [])
         if fwd:
-            orig_text, ents = prepend_forwarded(orig_text, ents)
+            orig_text, ents = prepend_forwarded(orig_text, ents, fwd_prefix)
             ents = list(ents) if ents else []
-        if len(orig_text) + 12 > MAX_TEXT:
-            orig_text = orig_text[:MAX_TEXT - 12]
+        if len(orig_text) + 15 > MAX_TEXT:
+            orig_text = orig_text[:MAX_TEXT - 15]
             if ents:
                 lim = utf16_len(orig_text)
                 ents = [e for e in ents if e.offset + e.length <= lim]
-        new_text = orig_text + "\n\n[edited]"
-        offset = utf16_len(orig_text) + 2
-        ents.append(types.MessageEntity(type='bold', offset=offset, length=8))
+        
         for r_id, b_id in relations:
-            def edit_task(target_uid=r_id, msg_id=b_id, txt=new_text, e=ents):
+            edit_sfx = "\n\n" + t(r_id, 'edited')
+            new_text = orig_text + edit_sfx
+            offset = utf16_len(orig_text) + 2
+            e_copy = list(ents)
+            e_copy.append(types.MessageEntity(type='bold', offset=offset, length=utf16_len(t(r_id, 'edited'))))
+            
+            def edit_task(target_uid=r_id, msg_id=b_id, txt=new_text, e=e_copy):
                 try: bot.edit_message_text(txt, chat_id=target_uid, message_id=msg_id, entities=e)
                 except Exception: pass
             executor.submit(edit_task)
@@ -487,18 +538,22 @@ def handle_edit(message):
         orig_cap = message.caption or ''
         ents = list(message.caption_entities or [])
         if fwd:
-            orig_cap, ents = prepend_forwarded(orig_cap, ents)
+            orig_cap, ents = prepend_forwarded(orig_cap, ents, fwd_prefix)
             ents = list(ents) if ents else []
-        if len(orig_cap) + 12 > MAX_CAPTION:
-            orig_cap = orig_cap[:MAX_CAPTION - 12]
+        if len(orig_cap) + 15 > MAX_CAPTION:
+            orig_cap = orig_cap[:MAX_CAPTION - 15]
             if ents:
                 lim = utf16_len(orig_cap)
                 ents = [e for e in ents if e.offset + e.length <= lim]
-        new_cap = orig_cap + "\n\n[edited]"
-        offset = utf16_len(orig_cap) + 2
-        ents.append(types.MessageEntity(type='bold', offset=offset, length=8))
+        
         for r_id, b_id in relations:
-            def edit_media(target_uid=r_id, msg_id=b_id, cap=new_cap, e=ents):
+            edit_sfx = "\n\n" + t(r_id, 'edited')
+            new_cap = orig_cap + edit_sfx
+            offset = utf16_len(orig_cap) + 2
+            e_copy = list(ents)
+            e_copy.append(types.MessageEntity(type='bold', offset=offset, length=utf16_len(t(r_id, 'edited'))))
+            
+            def edit_media(target_uid=r_id, msg_id=b_id, cap=new_cap, e=e_copy):
                 try: bot.edit_message_caption(chat_id=target_uid, message_id=msg_id, caption=cap, caption_entities=e)
                 except Exception: pass
             executor.submit(edit_media)
@@ -531,9 +586,7 @@ def handle_reaction(reaction):
 
 def channel_stats_loop(bot_username):
     global stats_msg_id, last_stats_count, last_stats_date
-    if not CHANNEL:
-        return
-        
+    if not CHANNEL: return
     try:
         channel_id = int(CHANNEL) if str(CHANNEL).startswith('-100') else CHANNEL
     except ValueError:
@@ -571,10 +624,8 @@ def channel_stats_loop(bot_username):
                         stats_msg_id = msg.message_id
                 
                 last_stats_count = count
-
-        except Exception as e:
+        except Exception:
             pass
-            
         time.sleep(60)
 
 if __name__ == "__main__":
