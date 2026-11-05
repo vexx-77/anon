@@ -27,12 +27,15 @@ bot = telebot.TeleBot(TOKEN, parse_mode=None)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_DIR = os.path.join(BASE_DIR, "data")
-OLD_DB_FILE = os.path.join(DB_DIR, "users.json")
 SESSION_FILE = os.path.join(DB_DIR, "session.json")
-ALL_USERS_FILE = os.path.join(DB_DIR, "all_users.json")
+LOG_FILE = os.path.join(DB_DIR, "users.log")
+OLD_USERS_JSON = os.path.join(DB_DIR, "users.json")
+OLD_ALL_JSON = os.path.join(DB_DIR, "all_users.json")
 
 joined_users = set()
 user_langs = {}
+
+db_lock = threading.RLock()
 
 user_messages = {}
 msg_relations = OrderedDict()
@@ -86,7 +89,7 @@ TEXTS = {
     },
     'en': {
         'start': "<b>Anonymous Chat</b>\n\nStatus: <b>{status}</b>\n\n/join — join chat\n/exit — leave chat\n/rules — rules\n/help — help\n/lang — change language",
-        'help': "<b>Help</b>\n\nAll messages are anonymous. Nobody knows who you are.\nReply to messages (replies work).\nChannel link: {link}\n\n/online — who is online\n/check — check message",
+        'help': "<b>Help</b>\n\nAll messages are anonymous. Nobody will know your nickname.\nReply to messages (replies work).\nChannel link: {link}\n\n/online — who is online\n/check — check message",
         'rules': "<b>Rules</b>\n\nNo rules, send whatever you want.\nBut preferably don't flood the chat with spam.\nYou won't get in trouble, but preferably don't flood...",
         'status_on': "Online",
         'status_off': "Offline",
@@ -128,76 +131,123 @@ def dec_id(enc):
     xor = base64.b64decode(enc.encode()).decode()
     return int("".join(chr(ord(c) ^ 42) for c in xor))
 
-def save_session_db():
-    os.makedirs(DB_DIR, exist_ok=True)
+def _append_log(uid, lang):
     try:
-        with open(SESSION_FILE, "w") as f:
-            json.dump({"joined": [enc_id(u) for u in joined_users]}, f)
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{enc_id(uid)} {lang}\n")
+            f.flush()
     except Exception as e:
-        print(f"Session save error: {e}", flush=True)
+        print(f"Log append error: {e}", flush=True)
 
-def save_all_users_db():
-    os.makedirs(DB_DIR, exist_ok=True)
-    ru, en = [], []
-    for uid, lang in user_langs.items():
-        (ru if lang == 'ru' else en).append(enc_id(uid))
-    try:
-        with open(ALL_USERS_FILE, "w") as f:
-            json.dump({"ru": ru, "en": en}, f)
-    except Exception as e:
-        print(f"All users save error: {e}", flush=True)
+def save_session_db():
+    with db_lock:
+        os.makedirs(DB_DIR, exist_ok=True)
+        tmp = SESSION_FILE + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump({"joined": [enc_id(u) for u in joined_users]}, f)
+            os.replace(tmp, SESSION_FILE)
+        except Exception as e:
+            print(f"Session save error: {e}", flush=True)
+
+def compact_users_log():
+    with db_lock:
+        os.makedirs(DB_DIR, exist_ok=True)
+        tmp = LOG_FILE + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                for uid, lang in user_langs.items():
+                    f.write(f"{enc_id(uid)} {lang}\n")
+            os.replace(tmp, LOG_FILE)
+        except Exception as e:
+            print(f"Compact error: {e}", flush=True)
 
 def load_db():
     os.makedirs(DB_DIR, exist_ok=True)
-    if os.path.exists(OLD_DB_FILE) and not os.path.exists(SESSION_FILE):
+
+    if os.path.exists(OLD_USERS_JSON):
         try:
-            with open(OLD_DB_FILE) as f:
+            with open(OLD_USERS_JSON) as f:
                 data = json.load(f)
             for e, lang in data.get("users", {}).items():
                 user_langs[dec_id(e)] = lang
             for e in data.get("joined", []):
                 joined_users.add(dec_id(e))
             save_session_db()
-            save_all_users_db()
-            os.rename(OLD_DB_FILE, OLD_DB_FILE + ".bak")
+            os.rename(OLD_USERS_JSON, OLD_USERS_JSON + ".bak")
         except Exception as e:
-            print(f"Migration error: {e}", flush=True)
+            print(f"Migration (users.json) error: {e}", flush=True)
+
+    if os.path.exists(OLD_ALL_JSON):
+        try:
+            with open(OLD_ALL_JSON) as f:
+                data = json.load(f)
+            for e in data.get("ru", []):
+                user_langs[dec_id(e)] = 'ru'
+            for e in data.get("en", []):
+                user_langs[dec_id(e)] = 'en'
+            os.rename(OLD_ALL_JSON, OLD_ALL_JSON + ".bak")
+        except Exception as e:
+            print(f"Migration (all_users.json) error: {e}", flush=True)
+
+    if os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE) as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) != 2:
+                        continue
+                    enc, lang = parts
+                    try:
+                        uid = dec_id(enc)
+                    except Exception:
+                        continue
+                    if lang == '-':
+                        user_langs.pop(uid, None)
+                        joined_users.discard(uid)
+                    elif lang in ('ru', 'en'):
+                        user_langs[uid] = lang
+        except Exception as e:
+            print(f"Log load error: {e}", flush=True)
+
     if os.path.exists(SESSION_FILE):
         try:
             with open(SESSION_FILE) as f:
                 data = json.load(f)
             for e in data.get("joined", []):
-                joined_users.add(dec_id(e))
-        except Exception as e:
-            print(f"Session load error: {e}", flush=True)
-    if os.path.exists(ALL_USERS_FILE):
-        try:
-            with open(ALL_USERS_FILE) as f:
-                data = json.load(f)
-            for e in data.get("ru", []):
                 uid = dec_id(e)
+                joined_users.add(uid)
                 if uid not in user_langs:
                     user_langs[uid] = 'ru'
-            for e in data.get("en", []):
-                uid = dec_id(e)
-                if uid not in user_langs:
-                    user_langs[uid] = 'en'
         except Exception as e:
-            print(f"All users load error: {e}", flush=True)
+            print(f"Session load error: {e}", flush=True)
+
+    compact_users_log()
+    save_session_db()
 
 def add_all_user(uid, lang=None):
-    if uid in user_langs:
-        return
-    user_langs[uid] = lang or 'ru'
-    save_all_users_db()
+    with db_lock:
+        if uid in user_langs:
+            return
+        new_lang = lang or 'ru'
+        user_langs[uid] = new_lang
+        _append_log(uid, new_lang)
+
+def set_user_lang(uid, lang):
+    with db_lock:
+        if user_langs.get(uid) == lang:
+            return
+        user_langs[uid] = lang
+        _append_log(uid, lang)
 
 def remove_dead_user(uid):
-    if uid not in user_langs:
-        return
-    joined_users.discard(uid)
-    del user_langs[uid]
-    save_session_db()
-    save_all_users_db()
+    with db_lock:
+        if uid not in user_langs:
+            return
+        joined_users.discard(uid)
+        del user_langs[uid]
+        _append_log(uid, '-')
+        save_session_db()
 
 def utf16_len(s):
     return len(s.encode("utf-16-le")) // 2
@@ -410,7 +460,8 @@ def cmd_say(message):
                 if getattr(e, 'custom_emoji_id', None): ne.custom_emoji_id = e.custom_emoji_id
                 ents.append(ne)
 
-    targets = [u for u in user_langs.keys() if u != uid]
+    with db_lock:
+        targets = [u for u in user_langs.keys() if u != uid]
 
     def _send(target_uid):
         pfx = t(target_uid, 'announcement') + "\n"
@@ -442,10 +493,7 @@ def cmd_lang(message):
 def callback_lang(call):
     uid = call.from_user.id
     lang = call.data.split('_')[1]
-    old = user_langs.get(uid)
-    user_langs[uid] = lang
-    if old != lang:
-        save_all_users_db()
+    set_user_lang(uid, lang)
     bot.edit_message_text(chat_id=uid, message_id=call.message.message_id, text=t(uid, 'lang_set'), parse_mode='HTML')
 
 @bot.message_handler(commands=['start'])
@@ -471,10 +519,13 @@ def cmd_rules(message):
 def cmd_join(message):
     uid = message.from_user.id
     add_all_user(uid)
-    if uid in joined_users:
+    with db_lock:
+        already = uid in joined_users
+        if not already:
+            joined_users.add(uid)
+    if already:
         bot.send_message(uid, t(uid, 'join_already', count=len(joined_users)), parse_mode='HTML')
     else:
-        joined_users.add(uid)
         save_session_db()
         bot.send_message(uid, t(uid, 'join_success', count=len(joined_users)), parse_mode='HTML')
         notify_others(uid, t(uid, 'notify_join', count=len(joined_users)), t(uid, 'notify_join', count=len(joined_users)))
@@ -483,10 +534,13 @@ def cmd_join(message):
 def cmd_exit(message):
     uid = message.from_user.id
     add_all_user(uid)
-    if uid not in joined_users:
+    with db_lock:
+        in_session = uid in joined_users
+        if in_session:
+            joined_users.discard(uid)
+    if not in_session:
         bot.send_message(uid, t(uid, 'exit_already', count=len(joined_users)), parse_mode='HTML')
     else:
-        joined_users.discard(uid)
         save_session_db()
         bot.send_message(uid, t(uid, 'exit_success', count=len(joined_users)), parse_mode='HTML')
         notify_others(uid, t(uid, 'notify_exit', count=len(joined_users)), t(uid, 'notify_exit', count=len(joined_users)))
@@ -646,6 +700,14 @@ def channel_stats_loop(bot_username):
             pass
         time.sleep(60)
 
+def compact_loop():
+    while True:
+        time.sleep(3600)
+        try:
+            compact_users_log()
+        except Exception:
+            pass
+
 if __name__ == "__main__":
     load_db()
     bot.remove_webhook()
@@ -688,5 +750,6 @@ if __name__ == "__main__":
             except Exception: pass
     threading.Thread(target=restart_notify, daemon=True).start()
     threading.Thread(target=channel_stats_loop, args=(me.username,), daemon=True).start()
+    threading.Thread(target=compact_loop, daemon=True).start()
     print("[start] Bot is running", flush=True)
     bot.infinity_polling(timeout=30, long_polling_timeout=25, allowed_updates=['message', 'edited_message', 'message_reaction', 'callback_query'])
