@@ -66,7 +66,7 @@ last_stats_date = None
 TEXTS = {
     'ru': {
         'start': "<b>Анонимный чат</b>\n\nСтатус: <b>{status}</b>\n\n/join — зайти в чат\n/exit — выйти из чата\n/rules — правила\n/help — помощь\n/lang — сменить язык",
-        'help': "<b>Помощь</b>\n\nВсе сообщения анонимны. Твой ник никто не узнает.\nОтвечай на сообщения (реплаи работают).\nСсылка на канал: {link}\n\n/online — кто в сети\n/check — проверить сообщение",
+        'help': "<b>Помощь</b>\n\nВсе сообщения анонимны. Твой ник никто не узнает.\nОтвечай на сообщения (реплаи работают).\nСсылка на канал: {link}\n\n/online — сколько в сессии\n/check — проверить сообщение",
         'rules': "<b>Правила</b>\n\nПравил нет, отправляйте что хотите.\nНо желательно не засорять чат спамом.\nВам за это ничего не будет, но желательно не засорять...",
         'status_on': "В сети",
         'status_off': "Не в сети",
@@ -95,7 +95,7 @@ TEXTS = {
     },
     'en': {
         'start': "<b>Anonymous Chat</b>\n\nStatus: <b>{status}</b>\n\n/join — join chat\n/exit — leave chat\n/rules — rules\n/help — help\n/lang — change language",
-        'help': "<b>Help</b>\n\nAll messages are anonymous. Nobody will know your nickname.\nReply to messages (replies work).\nChannel link: {link}\n\n/online — who is online\n/check — check message",
+        'help': "<b>Help</b>\n\nAll messages are anonymous. Nobody will know your nickname.\nReply to messages (replies work).\nChannel link: {link}\n\n/online — users in session\n/check — check message",
         'rules': "<b>Rules</b>\n\nNo rules, send whatever you want.\nBut preferably don't flood the chat with spam.\nYou won't get in trouble, but preferably don't flood...",
         'status_on': "Online",
         'status_off': "Offline",
@@ -335,7 +335,7 @@ def animate_prefix(uid, msg_id, body_text, body_entities, pfx_key, base_shift):
                 
         full_text = new_pfx + "\n" + body_text
         try:
-            bot.edit_message_text(full_text, chat_id=uid, message_id=msg_id, entities=new_ents)
+            bot.edit_message_text(full_text, chat_id=uid, message_id=msg_id, entities=new_ents, disable_web_page_preview=True)
         except Exception:
             break
 
@@ -356,7 +356,7 @@ def send_system_message(uid, pfx_key, body_text, body_entities=None, reply_to=No
             
     full_text = pfx_full + body_text
     try:
-        m = bot.send_message(uid, full_text, entities=new_ents, reply_to_message_id=reply_to)
+        m = bot.send_message(uid, full_text, entities=new_ents, reply_to_message_id=reply_to, disable_web_page_preview=True)
         if auto_del:
             auto_delete_msg(uid, m.message_id)
             
@@ -376,14 +376,12 @@ def send_system_message(uid, pfx_key, body_text, body_entities=None, reply_to=No
     except Exception:
         return None
 
-def send_text_safe(uid, text, entities=None, reply_to=None, sys_msg=False, auto_del=False, lpo=None):
+def send_text_safe(uid, text, entities=None, reply_to=None, sys_msg=False, auto_del=False):
     try:
-        kw = {}
-        if lpo: kw['link_preview_options'] = lpo
         if sys_msg:
-            m = bot.send_message(uid, text, parse_mode='HTML', reply_to_message_id=reply_to, **kw)
+            m = bot.send_message(uid, text, parse_mode='HTML', reply_to_message_id=reply_to, disable_web_page_preview=True)
         else:
-            m = bot.send_message(uid, text, entities=entities, reply_to_message_id=reply_to, **kw)
+            m = bot.send_message(uid, text, entities=entities, reply_to_message_id=reply_to, disable_web_page_preview=True)
         if auto_del and m: auto_delete_msg(uid, m.message_id)
         return m
     except ApiTelegramException as e:
@@ -435,8 +433,7 @@ def send_task_wrapper(uid, ct, msg, reply_to):
         if fwd:
             prefix = t(uid, 'forwarded')
             text, ents = fit_text_with_forward(text, ents, MAX_TEXT, prefix)
-        lpo = getattr(msg, 'link_preview_options', None)
-        return send_text_safe(uid, text, entities=ents, reply_to=reply_to, lpo=lpo)
+        return send_text_safe(uid, text, entities=ents, reply_to=reply_to)
     elif ct in {'photo', 'video', 'document', 'audio'}:
         return send_media_task(uid, ct, msg, reply_to, fwd=fwd)
     elif ct in {'sticker', 'animation', 'voice', 'video_note'}:
@@ -492,21 +489,11 @@ def broadcast_message(message, sender_id, parent_thread_id=None):
             except Exception: pass
         user_messages[(sender_id, message.message_id)] = sent_relations
         
-        p_thread = threads.get(parent_thread_id) if parent_thread_id else None
-        if p_thread and p_thread.get("author_id") == 0:
-            # Ответ на системное сообщение, привязываем к той же ветке или создаем новую?
-            # Создаем новую ветку, но чтобы реплаи шли друг другу, сохраняем msg_ids.
-            threads[new_thread_id] = {
-                "author_id": sender_id,
-                "original_msg_id": message.message_id,
-                "msg_ids": new_msg_ids
-            }
-        else:
-            threads[new_thread_id] = {
-                "author_id": sender_id,
-                "original_msg_id": message.message_id,
-                "msg_ids": new_msg_ids
-            }
+        threads[new_thread_id] = {
+            "author_id": sender_id,
+            "original_msg_id": message.message_id,
+            "msg_ids": new_msg_ids
+        }
         while len(threads) > 50000:
             threads.popitem(last=False)
     except Exception: pass
@@ -680,19 +667,19 @@ def cmd_start(message):
     uid = message.from_user.id
     add_all_user(uid)
     status = t(uid, 'status_on') if uid in joined_users else t(uid, 'status_off')
-    bot.send_message(uid, t(uid, 'start', status=status), parse_mode='HTML')
+    bot.send_message(uid, t(uid, 'start', status=status), parse_mode='HTML', disable_web_page_preview=True)
 
 @bot.message_handler(commands=['help'])
 def cmd_help(message):
     uid = message.from_user.id
     add_all_user(uid)
-    bot.send_message(uid, t(uid, 'help', link=CHANNEL_LINK), parse_mode='HTML')
+    bot.send_message(uid, t(uid, 'help', link=CHANNEL_LINK), parse_mode='HTML', disable_web_page_preview=True)
 
 @bot.message_handler(commands=['rules'])
 def cmd_rules(message):
     uid = message.from_user.id
     add_all_user(uid)
-    bot.send_message(uid, t(uid, 'rules'), parse_mode='HTML')
+    bot.send_message(uid, t(uid, 'rules'), parse_mode='HTML', disable_web_page_preview=True)
 
 @bot.message_handler(commands=['join'])
 def cmd_join(message):
@@ -703,10 +690,10 @@ def cmd_join(message):
         if not already:
             joined_users.add(uid)
     if already:
-        bot.send_message(uid, t(uid, 'join_already', count=len(joined_users)), parse_mode='HTML')
+        bot.send_message(uid, t(uid, 'join_already', count=len(joined_users)), parse_mode='HTML', disable_web_page_preview=True)
     else:
         save_session_db()
-        bot.send_message(uid, t(uid, 'join_success', count=len(joined_users)), parse_mode='HTML')
+        bot.send_message(uid, t(uid, 'join_success', count=len(joined_users)), parse_mode='HTML', disable_web_page_preview=True)
         notify_others(uid, t('ru', 'notify_join', count=len(joined_users)), t('en', 'notify_join', count=len(joined_users)))
 
 @bot.message_handler(commands=['exit'])
@@ -718,10 +705,10 @@ def cmd_exit(message):
         if in_session:
             joined_users.discard(uid)
     if not in_session:
-        bot.send_message(uid, t(uid, 'exit_already', count=len(joined_users)), parse_mode='HTML')
+        bot.send_message(uid, t(uid, 'exit_already', count=len(joined_users)), parse_mode='HTML', disable_web_page_preview=True)
     else:
         save_session_db()
-        bot.send_message(uid, t(uid, 'exit_success', count=len(joined_users)), parse_mode='HTML')
+        bot.send_message(uid, t(uid, 'exit_success', count=len(joined_users)), parse_mode='HTML', disable_web_page_preview=True)
         notify_others(uid, t('ru', 'notify_exit', count=len(joined_users)), t('en', 'notify_exit', count=len(joined_users)))
 
 @bot.message_handler(commands=['online'])
@@ -750,10 +737,10 @@ def handle_any(message):
     uid = message.from_user.id
     add_all_user(uid)
     if uid not in joined_users:
-        bot.send_message(uid, t(uid, 'err_not_joined'), parse_mode='HTML')
+        bot.send_message(uid, t(uid, 'err_not_joined'), parse_mode='HTML', disable_web_page_preview=True)
         return
     if is_spamming(uid):
-        bot.send_message(uid, t(uid, 'err_spam'), parse_mode='HTML')
+        bot.send_message(uid, t(uid, 'err_spam'), parse_mode='HTML', disable_web_page_preview=True)
         return
     parent_thread_id = None
     if message.reply_to_message:
@@ -804,7 +791,7 @@ def handle_edit(message):
             e_copy = list(ents)
             e_copy.append(types.MessageEntity(type='bold', offset=offset, length=utf16_len(edit_word)))
             def edit_task(target_uid=r_id, msg_id=b_id, txt=new_text, e=e_copy):
-                try: bot.edit_message_text(txt, chat_id=target_uid, message_id=msg_id, entities=e)
+                try: bot.edit_message_text(txt, chat_id=target_uid, message_id=msg_id, entities=e, disable_web_page_preview=True)
                 except ApiTelegramException as err:
                     if err.error_code == 403: remove_dead_user(target_uid)
                 except Exception: pass
@@ -840,6 +827,28 @@ def handle_reaction(reaction):
     uid = reaction.user.id
     if uid not in joined_users: return
     key = (uid, reaction.message_id)
+    
+    thread_id = msg_to_thread.get(key)
+    if thread_id:
+        p_thread = threads.get(thread_id)
+        if p_thread and p_thread.get("author_id") == 0:
+            old_emojis = {r.emoji for r in reaction.old_reaction if getattr(r, 'type', '') == 'emoji'}
+            new_emojis = {r.emoji for r in reaction.new_reaction if getattr(r, 'type', '') == 'emoji'}
+            added = new_emojis - old_emojis
+            if not added: return
+            emoji = list(added)[0]
+            
+            sys_thread_id = uuid.uuid4().hex
+            msg_ids = {}
+            for u in list(joined_users):
+                r_to = p_thread["msg_ids"].get(u)
+                body_other = t(u, 'reaction_body', emoji=emoji)
+                m = send_system_message(u, 'reaction_pfx', body_other, reply_to=r_to, thread_id=sys_thread_id)
+                if m: msg_ids[u] = m.message_id
+            if msg_ids:
+                threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids}
+            return
+
     if key not in msg_relations: return
     author_id, orig_msg_id = msg_relations[key]
     old_emojis = {r.emoji for r in reaction.old_reaction if getattr(r, 'type', '') == 'emoji'}
@@ -891,13 +900,13 @@ def channel_stats_loop(bot_username):
                     except Exception: pass
                     stats_msg_id = None
                 if not stats_msg_id:
-                    msg = bot.send_message(channel_id, text, parse_mode='HTML')
+                    msg = bot.send_message(channel_id, text, parse_mode='HTML', disable_web_page_preview=True)
                     stats_msg_id = msg.message_id
                 else:
                     try:
-                        bot.edit_message_text(text, chat_id=channel_id, message_id=stats_msg_id, parse_mode='HTML')
+                        bot.edit_message_text(text, chat_id=channel_id, message_id=stats_msg_id, parse_mode='HTML', disable_web_page_preview=True)
                     except Exception:
-                        msg = bot.send_message(channel_id, text, parse_mode='HTML')
+                        msg = bot.send_message(channel_id, text, parse_mode='HTML', disable_web_page_preview=True)
                         stats_msg_id = msg.message_id
                 last_stats_count = count
         except Exception: pass
@@ -914,30 +923,22 @@ if __name__ == "__main__":
     bot.remove_webhook()
     me = bot.get_me()
     BOT_ID = me.id
-    commands_ru = [
-        types.BotCommand("start", "Начать"),
-        types.BotCommand("join", "Зайти в чат"),
-        types.BotCommand("exit", "Выйти из чата"),
-        types.BotCommand("rules", "Правила"),
-        types.BotCommand("help", "Помощь"),
-        types.BotCommand("lang", "Сменить язык"),
-        types.BotCommand("online", "Кто в сети"),
-        types.BotCommand("check", "Проверить сообщение")
+    
+    commands_all = [
+        types.BotCommand("start", "Начать / Start"),
+        types.BotCommand("join", "Зайти в чат / Join the chat"),
+        types.BotCommand("exit", "Выйти из чата / Leave the chat"),
+        types.BotCommand("check", "Проверить сообщение / Check message"),
+        types.BotCommand("online", "Сколько в сессии / Users in session"),
+        types.BotCommand("rules", "Правила / Rules"),
+        types.BotCommand("help", "Помощь / Help"),
+        types.BotCommand("lang", "Сменить язык / Change language")
     ]
-    commands_en = [
-        types.BotCommand("start", "Start"),
-        types.BotCommand("join", "Join chat"),
-        types.BotCommand("exit", "Leave chat"),
-        types.BotCommand("rules", "Rules"),
-        types.BotCommand("help", "Help"),
-        types.BotCommand("lang", "Change language"),
-        types.BotCommand("online", "Who is online"),
-        types.BotCommand("check", "Check message")
-    ]
+    
     try:
-        bot.set_my_commands(commands_ru, language_code='ru')
-        bot.set_my_commands(commands_en, language_code='en')
-        bot.set_my_commands(commands_en)
+        bot.set_my_commands(commands_all)
+        bot.set_my_commands(commands_all, language_code='ru')
+        bot.set_my_commands(commands_all, language_code='en')
     except Exception: pass
 
     def restart_notify():
