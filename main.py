@@ -34,6 +34,7 @@ OLD_ALL_JSON = os.path.join(DB_DIR, "all_users.json")
 
 joined_users = set()
 user_langs = {}
+last_activity = {}
 
 db_lock = threading.RLock()
 
@@ -48,6 +49,7 @@ media_group_lock = threading.Lock()
 msg_counter = {}
 SPAM_LIMIT = 20
 SPAM_WINDOW = 60.0
+AFK_TIMEOUT = 86400.0
 
 MAX_TEXT = 4096
 MAX_CAPTION = 1024
@@ -91,7 +93,8 @@ TEXTS = {
         'reaction_pfx': "[реакция]",
         'reaction_body': "+ {emoji}",
         'admin': "[админ]",
-        'announcement': "[объявление]"
+        'announcement': "[объявление]",
+        'afk_kick': "Вы были отключены от сессии\nПричина: AFK"
     },
     'en': {
         'start': "<b>Anonymous Chat</b>\n\nStatus: <b>{status}</b>\n\n/join — join chat\n/exit — leave chat\n/rules — rules\n/help — help\n/lang — change language",
@@ -120,7 +123,8 @@ TEXTS = {
         'reaction_pfx': "[reaction]",
         'reaction_body': "+ {emoji}",
         'admin': "[admin]",
-        'announcement': "[announcement]"
+        'announcement': "[announcement]",
+        'afk_kick': "You have been disconnected from the session\nReason: AFK"
     }
 }
 
@@ -223,6 +227,9 @@ def load_db():
                     user_langs[uid] = 'ru'
         except Exception as e:
             print(f"Session load error: {e}", flush=True)
+    now = time.time()
+    for uid in joined_users:
+        last_activity[uid] = now
     compact_users_log()
     save_session_db()
 
@@ -243,6 +250,7 @@ def remove_dead_user(uid):
     with db_lock:
         if uid not in user_langs: return
         joined_users.discard(uid)
+        last_activity.pop(uid, None)
         del user_langs[uid]
         _append_log(uid, '-')
         save_session_db()
@@ -322,7 +330,6 @@ def animate_prefix(uid, msg_id, body_text, body_entities, pfx_key, base_shift):
         new_pfx = _get_animated_prefix(pfx, tick)
         new_shift = utf16_len(new_pfx + "\n")
         diff = new_shift - base_shift
-        
         new_ents = [types.MessageEntity(type='bold', offset=0, length=utf16_len(new_pfx))]
         if body_entities:
             for e in body_entities:
@@ -332,7 +339,6 @@ def animate_prefix(uid, msg_id, body_text, body_entities, pfx_key, base_shift):
                 if getattr(e, 'language', None): ne.language = e.language
                 if getattr(e, 'custom_emoji_id', None): ne.custom_emoji_id = e.custom_emoji_id
                 new_ents.append(ne)
-                
         full_text = new_pfx + "\n" + body_text
         try:
             bot.edit_message_text(full_text, chat_id=uid, message_id=msg_id, entities=new_ents, disable_web_page_preview=True)
@@ -343,7 +349,6 @@ def send_system_message(uid, pfx_key, body_text, body_entities=None, reply_to=No
     pfx = t(uid, pfx_key)
     pfx_full = pfx + "\n"
     shift = utf16_len(pfx_full)
-    
     new_ents = [types.MessageEntity(type='bold', offset=0, length=utf16_len(pfx))]
     if body_entities:
         for e in body_entities:
@@ -353,22 +358,18 @@ def send_system_message(uid, pfx_key, body_text, body_entities=None, reply_to=No
             if getattr(e, 'language', None): ne.language = e.language
             if getattr(e, 'custom_emoji_id', None): ne.custom_emoji_id = e.custom_emoji_id
             new_ents.append(ne)
-            
     full_text = pfx_full + body_text
     try:
         m = bot.send_message(uid, full_text, entities=new_ents, reply_to_message_id=reply_to, disable_web_page_preview=True)
         if auto_del:
             auto_delete_msg(uid, m.message_id)
-            
         threading.Thread(
             target=animate_prefix, 
             args=(uid, m.message_id, body_text, body_entities, pfx_key, shift), 
             daemon=True
         ).start()
-        
         if thread_id:
             add_to_od(msg_to_thread, (uid, m.message_id), thread_id, 50000)
-            
         return m
     except ApiTelegramException as e:
         if e.error_code == 403: remove_dead_user(uid)
@@ -408,9 +409,7 @@ def send_media_task(uid, ct, msg, reply_to, fwd=False):
                 if utf16_len(caption) > MAX_CAPTION:
                     caption = caption[:MAX_CAPTION]
                     cap_ent = None
-            
             has_spoiler = getattr(msg, 'has_media_spoiler', False)
-            
             if ct == 'photo':
                 m = bot.send_photo(uid, msg.photo[-1].file_id, caption=caption, caption_entities=cap_ent, reply_to_message_id=reply_to, has_spoiler=has_spoiler)
             elif ct == 'video':
@@ -459,13 +458,29 @@ def send_task_wrapper(uid, ct, msg, reply_to):
             return None
         except Exception: return None
 
+def sort_targets_by_priority(targets, now=None):
+    if now is None:
+        now = time.time()
+    def key(uid):
+        t_act = last_activity.get(uid, 0)
+        delta = now - t_act
+        if delta < 60:
+            pri = 0
+        elif delta < 300:
+            pri = 1
+        else:
+            pri = 2
+        return (pri, -t_act)
+    return sorted(targets, key=key)
+
 def broadcast_message(message, sender_id, parent_thread_id=None):
     try:
         new_thread_id = uuid.uuid4().hex
         new_msg_ids = {}
         sent_relations = []
-        targets = [u for u in joined_users if u != sender_id]
-        if not targets: return
+        raw_targets = [u for u in joined_users if u != sender_id]
+        if not raw_targets: return
+        targets = sort_targets_by_priority(raw_targets)
         ct = message.content_type
         futures = []
         for uid in targets:
@@ -488,7 +503,6 @@ def broadcast_message(message, sender_id, parent_thread_id=None):
                     add_to_od(msg_to_thread, (uid, m.message_id), new_thread_id, 50000)
             except Exception: pass
         user_messages[(sender_id, message.message_id)] = sent_relations
-        
         threads[new_thread_id] = {
             "author_id": sender_id,
             "original_msg_id": message.message_id,
@@ -506,18 +520,15 @@ def process_album(gid):
     sender_id = data["sender_id"]
     parent_thread_id = data["parent_thread_id"]
     msgs.sort(key=lambda m: m.message_id)
-    
     try:
         new_thread_id = uuid.uuid4().hex
         new_msg_ids = {}
-        targets = [u for u in joined_users if u != sender_id]
-        if not targets: return
-        
+        raw_targets = [u for u in joined_users if u != sender_id]
+        if not raw_targets: return
+        targets = sort_targets_by_priority(raw_targets)
         first_msg = msgs[0]
         fwd = is_forwarded(first_msg)
-        
         all_sent_relations = {m.message_id: [] for m in msgs}
-        
         for uid in targets:
             reply_to_id = None
             if parent_thread_id and parent_thread_id in threads:
@@ -526,22 +537,18 @@ def process_album(gid):
                     reply_to_id = p_thread["original_msg_id"]
                 else:
                     reply_to_id = p_thread["msg_ids"].get(uid)
-                    
             media = []
             for i, m in enumerate(msgs):
                 ct = m.content_type
                 cap = m.caption or ''
                 cap_ent = m.caption_entities
-                
                 if i == 0 and fwd:
                     prefix = t(uid, 'forwarded')
                     cap, cap_ent = fit_text_with_forward(cap, cap_ent, MAX_CAPTION, prefix)
                 elif utf16_len(cap) > MAX_CAPTION:
                     cap = cap[:MAX_CAPTION]
                     cap_ent = None
-                    
                 has_spoiler = getattr(m, 'has_media_spoiler', False)
-                
                 if ct == 'photo':
                     media.append(types.InputMediaPhoto(m.photo[-1].file_id, caption=cap, caption_entities=cap_ent, has_spoiler=has_spoiler))
                 elif ct == 'video':
@@ -550,9 +557,7 @@ def process_album(gid):
                     media.append(types.InputMediaDocument(m.document.file_id, caption=cap, caption_entities=cap_ent))
                 elif ct == 'audio':
                     media.append(types.InputMediaAudio(m.audio.file_id, caption=cap, caption_entities=cap_ent, title=getattr(m.audio, 'title', None), performer=getattr(m.audio, 'performer', None)))
-                    
             if not media: continue
-            
             try:
                 bot_msgs = bot.send_media_group(uid, media, reply_to_message_id=reply_to_id)
                 for idx, bm in enumerate(bot_msgs):
@@ -566,10 +571,8 @@ def process_album(gid):
             except ApiTelegramException as e:
                 if e.error_code == 403: remove_dead_user(uid)
             except Exception: pass
-                
         for orig_msg_id, rels in all_sent_relations.items():
             user_messages[(sender_id, orig_msg_id)] = rels
-            
         threads[new_thread_id] = {
             "author_id": sender_id,
             "original_msg_id": msgs[0].message_id,
@@ -582,12 +585,13 @@ def process_album(gid):
 def notify_others(sender_id, body_ru, body_en):
     sys_thread_id = uuid.uuid4().hex
     msg_ids = {}
-    for u in list(joined_users):
-        if u != sender_id:
-            txt = body_ru if user_langs.get(u, 'ru') == 'ru' else body_en
-            m = send_system_message(u, 'bot', txt, auto_del=True, thread_id=sys_thread_id)
-            if m: msg_ids[u] = m.message_id
-    threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids}
+    raw_targets = [u for u in joined_users if u != sender_id]
+    targets = sort_targets_by_priority(raw_targets)
+    for u in targets:
+        txt = body_ru if user_langs.get(u, 'ru') == 'ru' else body_en
+        m = send_system_message(u, 'bot', txt, auto_del=True, thread_id=sys_thread_id)
+        if m: msg_ids[u] = m.message_id
+    threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids, "is_reaction": False}
 
 @bot.message_handler(commands=['say'])
 def cmd_say(message):
@@ -608,15 +612,14 @@ def cmd_say(message):
                 if getattr(e, 'custom_emoji_id', None): ne.custom_emoji_id = e.custom_emoji_id
                 ents.append(ne)
     with db_lock:
-        targets = [u for u in user_langs.keys() if u != uid]
-        
+        raw_targets = [u for u in user_langs.keys() if u != uid]
+    targets = sort_targets_by_priority(raw_targets)
     sys_thread_id = uuid.uuid4().hex
     msg_ids = {}
     for u in targets:
         m = send_system_message(u, 'announcement', orig_text, ents, thread_id=sys_thread_id)
         if m: msg_ids[u] = m.message_id
-        
-    threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids}
+    threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids, "is_reaction": False}
     bot.send_message(uid, f"Разослано: {len(targets)}", disable_web_page_preview=True)
 
 @bot.message_handler(commands=['sms'])
@@ -638,15 +641,14 @@ def cmd_sms(message):
                 if getattr(e, 'custom_emoji_id', None): ne.custom_emoji_id = e.custom_emoji_id
                 ents.append(ne)
     with db_lock:
-        targets = [u for u in joined_users if u != uid]
-        
+        raw_targets = [u for u in joined_users if u != uid]
+    targets = sort_targets_by_priority(raw_targets)
     sys_thread_id = uuid.uuid4().hex
     msg_ids = {}
     for u in targets:
         m = send_system_message(u, 'admin', orig_text, ents, thread_id=sys_thread_id)
         if m: msg_ids[u] = m.message_id
-        
-    threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids}
+    threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids, "is_reaction": False}
     bot.send_message(uid, f"Разослано в сессию: {len(targets)}", disable_web_page_preview=True)
 
 @bot.message_handler(commands=['lang'])
@@ -691,6 +693,7 @@ def cmd_join(message):
         already = uid in joined_users
         if not already:
             joined_users.add(uid)
+            last_activity[uid] = time.time()
     if already:
         bot.send_message(uid, t(uid, 'join_already', count=len(joined_users)), parse_mode='HTML', disable_web_page_preview=True)
     else:
@@ -706,6 +709,7 @@ def cmd_exit(message):
         in_session = uid in joined_users
         if in_session:
             joined_users.discard(uid)
+            last_activity.pop(uid, None)
     if not in_session:
         bot.send_message(uid, t(uid, 'exit_already', count=len(joined_users)), parse_mode='HTML', disable_web_page_preview=True)
     else:
@@ -744,10 +748,10 @@ def handle_any(message):
     if is_spamming(uid):
         bot.send_message(uid, t(uid, 'err_spam'), parse_mode='HTML', disable_web_page_preview=True)
         return
+    last_activity[uid] = time.time()
     parent_thread_id = None
     if message.reply_to_message:
         parent_thread_id = msg_to_thread.get((uid, message.reply_to_message.message_id))
-        
     if message.media_group_id:
         gid = message.media_group_id
         with media_group_lock:
@@ -760,7 +764,6 @@ def handle_any(message):
                 threading.Timer(1.0, process_album, args=(gid,)).start()
             media_group_buffer[gid]["messages"].append(message)
         return
-        
     threading.Thread(target=broadcast_message, args=(message, uid, parent_thread_id), daemon=True).start()
 
 @bot.edited_message_handler(content_types=['text', 'photo', 'video', 'document', 'audio'])
@@ -773,7 +776,6 @@ def handle_edit(message):
     relations = user_messages[key]
     fwd = is_forwarded(message)
     fwd_prefix = t(uid, 'forwarded')
-
     if message.content_type == 'text':
         orig_text = message.text or ''
         ents = list(message.entities or [])
@@ -829,23 +831,22 @@ def handle_reaction(reaction):
     uid = reaction.user.id
     if uid not in joined_users: return
     key = (uid, reaction.message_id)
-    
     thread_id = msg_to_thread.get(key)
     if thread_id:
         p_thread = threads.get(thread_id)
         if p_thread and p_thread.get("author_id") == 0:
             if p_thread.get("is_reaction"):
                 return
-                
             old_emojis = {r.emoji for r in reaction.old_reaction if getattr(r, 'type', '') == 'emoji'}
             new_emojis = {r.emoji for r in reaction.new_reaction if getattr(r, 'type', '') == 'emoji'}
             added = new_emojis - old_emojis
             if not added: return
             emoji = list(added)[0]
-            
             sys_thread_id = uuid.uuid4().hex
             msg_ids = {}
-            for u in list(joined_users):
+            raw_targets = list(joined_users)
+            targets = sort_targets_by_priority(raw_targets)
+            for u in targets:
                 r_to = p_thread["msg_ids"].get(u)
                 body_other = t(u, 'reaction_body', emoji=emoji)
                 m = send_system_message(u, 'reaction_pfx', body_other, reply_to=r_to, thread_id=sys_thread_id)
@@ -853,7 +854,6 @@ def handle_reaction(reaction):
             if msg_ids:
                 threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids, "is_reaction": True}
             return
-
     if key not in msg_relations: return
     author_id, orig_msg_id = msg_relations[key]
     old_emojis = {r.emoji for r in reaction.old_reaction if getattr(r, 'type', '') == 'emoji'}
@@ -861,12 +861,12 @@ def handle_reaction(reaction):
     added = new_emojis - old_emojis
     if not added: return
     emoji = list(added)[0]
-    
     sys_thread_id = uuid.uuid4().hex
     msg_ids = {}
     relations = user_messages.get((author_id, orig_msg_id), [])
-    
-    for u in list(joined_users):
+    raw_targets = list(joined_users)
+    targets = sort_targets_by_priority(raw_targets)
+    for u in targets:
         r_to = None
         if u == author_id:
             r_to = orig_msg_id
@@ -875,13 +875,28 @@ def handle_reaction(reaction):
                 if r_id == u:
                     r_to = b_id
                     break
-                    
         body_other = t(u, 'reaction_body', emoji=emoji)
         m = send_system_message(u, 'reaction_pfx', body_other, reply_to=r_to, thread_id=sys_thread_id)
         if m: msg_ids[u] = m.message_id
-        
     if msg_ids:
         threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids, "is_reaction": True}
+
+def afk_check_loop():
+    while True:
+        time.sleep(300)
+        now = time.time()
+        kicked = []
+        with db_lock:
+            for uid in list(joined_users):
+                t_act = last_activity.get(uid, 0)
+                if now - t_act > AFK_TIMEOUT:
+                    joined_users.discard(uid)
+                    last_activity.pop(uid, None)
+                    kicked.append(uid)
+            if kicked:
+                save_session_db()
+        for uid in kicked:
+            send_system_message(uid, 'bot', t(uid, 'afk_kick'))
 
 def channel_stats_loop(bot_username):
     global stats_msg_id, last_stats_count, last_stats_date
@@ -931,7 +946,6 @@ if __name__ == "__main__":
     bot.remove_webhook()
     me = bot.get_me()
     BOT_ID = me.id
-    
     commands_all = [
         types.BotCommand("start", "Начать / Start"),
         types.BotCommand("join", "Зайти в чат / Join the chat"),
@@ -942,7 +956,6 @@ if __name__ == "__main__":
         types.BotCommand("help", "Помощь / Help"),
         types.BotCommand("lang", "Сменить язык / Change language")
     ]
-    
     try:
         bot.set_my_commands(commands_all)
         bot.set_my_commands(commands_all, language_code='ru')
@@ -950,10 +963,13 @@ if __name__ == "__main__":
     except Exception: pass
 
     def restart_notify():
-        for u in list(joined_users):
-            m = send_system_message(u, 'bot', t(u, 'restarted'))
+        raw_targets = list(joined_users)
+        targets = sort_targets_by_priority(raw_targets)
+        for u in targets:
+            send_system_message(u, 'bot', t(u, 'restarted'))
             
     threading.Thread(target=restart_notify, daemon=True).start()
+    threading.Thread(target=afk_check_loop, daemon=True).start()
     threading.Thread(target=channel_stats_loop, args=(me.username,), daemon=True).start()
     threading.Thread(target=compact_loop, daemon=True).start()
     print("[start] Bot is running", flush=True)
