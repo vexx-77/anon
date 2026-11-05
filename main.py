@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 import telebot
 from telebot import types
+from telebot.apihelper import ApiTelegramException
 
 TOKEN = os.environ.get("TOKEN")
 CHANNEL = os.environ.get("CHANNEL")
@@ -26,11 +27,12 @@ bot = telebot.TeleBot(TOKEN, parse_mode=None)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_DIR = os.path.join(BASE_DIR, "data")
-DB_FILE = os.path.join(DB_DIR, "users.json")
+OLD_DB_FILE = os.path.join(DB_DIR, "users.json")
+SESSION_FILE = os.path.join(DB_DIR, "session.json")
+ALL_USERS_FILE = os.path.join(DB_DIR, "all_users.json")
 
 joined_users = set()
 user_langs = {}
-all_users = set()
 
 user_messages = {}
 msg_relations = OrderedDict()
@@ -126,40 +128,83 @@ def dec_id(enc):
     xor = base64.b64decode(enc.encode()).decode()
     return int("".join(chr(ord(c) ^ 42) for c in xor))
 
-def save_db():
+def save_session_db():
     os.makedirs(DB_DIR, exist_ok=True)
-    data = {"users": {}, "joined": []}
-    for uid in all_users:
-        data["users"][enc_id(uid)] = user_langs.get(uid, 'ru')
-    for uid in joined_users:
-        data["joined"].append(enc_id(uid))
     try:
-        with open(DB_FILE, "w") as f:
-            json.dump(data, f)
+        with open(SESSION_FILE, "w") as f:
+            json.dump({"joined": [enc_id(u) for u in joined_users]}, f)
     except Exception as e:
-        print(f"DB save error: {e}", flush=True)
+        print(f"Session save error: {e}", flush=True)
+
+def save_all_users_db():
+    os.makedirs(DB_DIR, exist_ok=True)
+    ru, en = [], []
+    for uid, lang in user_langs.items():
+        (ru if lang == 'ru' else en).append(enc_id(uid))
+    try:
+        with open(ALL_USERS_FILE, "w") as f:
+            json.dump({"ru": ru, "en": en}, f)
+    except Exception as e:
+        print(f"All users save error: {e}", flush=True)
 
 def load_db():
-    if not os.path.exists(DB_FILE):
+    os.makedirs(DB_DIR, exist_ok=True)
+    if os.path.exists(OLD_DB_FILE) and not os.path.exists(SESSION_FILE):
+        try:
+            with open(OLD_DB_FILE) as f:
+                data = json.load(f)
+            for e, lang in data.get("users", {}).items():
+                user_langs[dec_id(e)] = lang
+            for e in data.get("joined", []):
+                joined_users.add(dec_id(e))
+            save_session_db()
+            save_all_users_db()
+            os.rename(OLD_DB_FILE, OLD_DB_FILE + ".bak")
+        except Exception as e:
+            print(f"Migration error: {e}", flush=True)
+    if os.path.exists(SESSION_FILE):
+        try:
+            with open(SESSION_FILE) as f:
+                data = json.load(f)
+            for e in data.get("joined", []):
+                joined_users.add(dec_id(e))
+        except Exception as e:
+            print(f"Session load error: {e}", flush=True)
+    if os.path.exists(ALL_USERS_FILE):
+        try:
+            with open(ALL_USERS_FILE) as f:
+                data = json.load(f)
+            for e in data.get("ru", []):
+                uid = dec_id(e)
+                if uid not in user_langs:
+                    user_langs[uid] = 'ru'
+            for e in data.get("en", []):
+                uid = dec_id(e)
+                if uid not in user_langs:
+                    user_langs[uid] = 'en'
+        except Exception as e:
+            print(f"All users load error: {e}", flush=True)
+
+def add_all_user(uid, lang=None):
+    if uid in user_langs:
         return
-    try:
-        with open(DB_FILE, "r") as f:
-            data = json.load(f)
-            for enc_uid, lang in data.get("users", {}).items():
-                uid = dec_id(enc_uid)
-                all_users.add(uid)
-                user_langs[uid] = lang
-            for enc_uid in data.get("joined", []):
-                joined_users.add(dec_id(enc_uid))
-    except Exception as e:
-        print(f"DB load error: {e}", flush=True)
+    user_langs[uid] = lang or 'ru'
+    save_all_users_db()
+
+def remove_dead_user(uid):
+    if uid not in user_langs:
+        return
+    joined_users.discard(uid)
+    del user_langs[uid]
+    save_session_db()
+    save_all_users_db()
 
 def utf16_len(s):
     return len(s.encode("utf-16-le")) // 2
 
 def is_spamming(uid):
     now = time.time()
-    times = [t for t in msg_counter.get(uid, []) if now - t < SPAM_WINDOW]
+    times = [x for x in msg_counter.get(uid, []) if now - x < SPAM_WINDOW]
     times.append(now)
     msg_counter[uid] = times
     return len(times) > SPAM_LIMIT
@@ -230,6 +275,10 @@ def send_text_safe(uid, text, entities=None, reply_to=None, sys_msg=False, auto_
         if auto_del and m:
             auto_delete_msg(uid, m.message_id)
         return m
+    except ApiTelegramException as e:
+        if e.error_code == 403:
+            remove_dead_user(uid)
+        return None
     except Exception:
         return None
 
@@ -240,12 +289,10 @@ def send_media_task(uid, ct, msg, reply_to, fwd=False):
         last = last_media_time.get(uid, 0)
         if now - last < 0.3:
             time.sleep(0.3 - (now - last))
-        
         m = None
         try:
             caption = msg.caption or ''
             cap_ent = msg.caption_entities
-            
             if fwd:
                 prefix = t(uid, 'forwarded')
                 caption, cap_ent = fit_text_with_forward(caption, cap_ent, MAX_CAPTION, prefix)
@@ -253,7 +300,6 @@ def send_media_task(uid, ct, msg, reply_to, fwd=False):
                 if utf16_len(caption) > MAX_CAPTION:
                     caption = caption[:MAX_CAPTION]
                     cap_ent = None
-            
             if ct == 'photo':
                 m = bot.send_photo(uid, msg.photo[-1].file_id, caption=caption, caption_entities=cap_ent, reply_to_message_id=reply_to)
             elif ct == 'video':
@@ -262,9 +308,11 @@ def send_media_task(uid, ct, msg, reply_to, fwd=False):
                 m = bot.send_document(uid, msg.document.file_id, caption=caption, caption_entities=cap_ent, reply_to_message_id=reply_to)
             elif ct == 'audio':
                 m = bot.send_audio(uid, msg.audio.file_id, caption=caption, caption_entities=cap_ent, reply_to_message_id=reply_to)
+        except ApiTelegramException as e:
+            if e.error_code == 403:
+                remove_dead_user(uid)
         except Exception:
             pass
-        
         last_media_time[uid] = time.time()
         return m
 
@@ -276,10 +324,8 @@ def send_task_wrapper(uid, ct, msg, reply_to):
         if fwd:
             prefix = t(uid, 'forwarded')
             text, ents = fit_text_with_forward(text, ents, MAX_TEXT, prefix)
-        
         lpo = getattr(msg, 'link_preview_options', None)
         return send_text_safe(uid, text, entities=ents, reply_to=reply_to, lpo=lpo)
-        
     elif ct in {'photo', 'video', 'document', 'audio'}:
         return send_media_task(uid, ct, msg, reply_to, fwd=fwd)
     elif ct in {'sticker', 'animation', 'voice', 'video_note'}:
@@ -300,6 +346,10 @@ def send_task_wrapper(uid, ct, msg, reply_to):
                 return bot.send_voice(uid, msg.voice.file_id, reply_to_message_id=reply_to)
             elif ct == 'video_note':
                 return bot.send_video_note(uid, msg.video_note.file_id, reply_to_message_id=reply_to)
+        except ApiTelegramException as e:
+            if e.error_code == 403:
+                remove_dead_user(uid)
+            return None
         except Exception:
             return None
 
@@ -310,17 +360,14 @@ def broadcast_message(message, sender_id, parent_thread_id=None):
         sent_relations = []
         targets = [u for u in joined_users if u != sender_id]
         if not targets: return
-
         ct = message.content_type
         futures = []
-
         for uid in targets:
             reply_to_id = None
             if parent_thread_id and parent_thread_id in threads:
                 reply_to_id = threads[parent_thread_id].get(uid)
             fut = executor.submit(send_task_wrapper, uid, ct, message, reply_to_id)
             futures.append((uid, fut))
-
         for uid, fut in futures:
             try:
                 m = fut.result(timeout=15)
@@ -331,7 +378,6 @@ def broadcast_message(message, sender_id, parent_thread_id=None):
                     add_to_od(msg_to_thread, (uid, m.message_id), new_thread_id, 50000)
             except Exception:
                 pass
-
         user_messages[(sender_id, message.message_id)] = sent_relations
         threads[new_thread_id] = new_msg_ids
         while len(threads) > 50000:
@@ -349,14 +395,10 @@ def notify_others(sender_id, text_ru, text_en):
 def cmd_say(message):
     uid = message.from_user.id
     if uid != ADMIN: return
-    if len(message.text) <= 5: return
-    
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2: return
-    
     offset = len(parts[0]) + 1
     orig_text = parts[1]
-    
     ents = []
     if message.entities:
         for e in message.entities:
@@ -367,11 +409,13 @@ def cmd_say(message):
                 if getattr(e, 'language', None): ne.language = e.language
                 if getattr(e, 'custom_emoji_id', None): ne.custom_emoji_id = e.custom_emoji_id
                 ents.append(ne)
-    
-    for u in list(joined_users):
-        pfx = t(u, 'announcement') + "\n"
+
+    targets = [u for u in user_langs.keys() if u != uid]
+
+    def _send(target_uid):
+        pfx = t(target_uid, 'announcement') + "\n"
         shift = utf16_len(pfx)
-        new_ents = []
+        new_ents = [types.MessageEntity(type='bold', offset=0, length=shift - 1)]
         for e in ents:
             ne = types.MessageEntity(type=e.type, offset=e.offset + shift, length=e.length)
             if getattr(e, 'url', None): ne.url = e.url
@@ -379,13 +423,17 @@ def cmd_say(message):
             if getattr(e, 'language', None): ne.language = e.language
             if getattr(e, 'custom_emoji_id', None): ne.custom_emoji_id = e.custom_emoji_id
             new_ents.append(ne)
-        executor.submit(send_text_safe, u, pfx + orig_text, entities=new_ents, sys_msg=True)
+        send_text_safe(target_uid, pfx + orig_text, entities=new_ents, sys_msg=False)
+
+    for u in targets:
+        executor.submit(_send, u)
+
+    bot.send_message(uid, f"Разослано: {len(targets)}")
 
 @bot.message_handler(commands=['lang'])
 def cmd_lang(message):
     uid = message.from_user.id
-    all_users.add(uid)
-    save_db()
+    add_all_user(uid)
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(types.InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru"), types.InlineKeyboardButton("🇬🇧 English", callback_data="lang_en"))
     bot.send_message(uid, t(uid, 'lang_select'), reply_markup=markup)
@@ -394,61 +442,52 @@ def cmd_lang(message):
 def callback_lang(call):
     uid = call.from_user.id
     lang = call.data.split('_')[1]
+    old = user_langs.get(uid)
     user_langs[uid] = lang
-    all_users.add(uid)
-    save_db()
+    if old != lang:
+        save_all_users_db()
     bot.edit_message_text(chat_id=uid, message_id=call.message.message_id, text=t(uid, 'lang_set'), parse_mode='HTML')
 
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
     uid = message.from_user.id
-    all_users.add(uid)
-    if uid not in user_langs: user_langs[uid] = 'ru'
-    save_db()
+    add_all_user(uid)
     status = t(uid, 'status_on') if uid in joined_users else t(uid, 'status_off')
     bot.send_message(uid, t(uid, 'start', status=status), parse_mode='HTML')
 
 @bot.message_handler(commands=['help'])
 def cmd_help(message):
     uid = message.from_user.id
-    all_users.add(uid)
-    if uid not in user_langs: user_langs[uid] = 'ru'
-    save_db()
+    add_all_user(uid)
     bot.send_message(uid, t(uid, 'help', link=CHANNEL_LINK), parse_mode='HTML')
 
 @bot.message_handler(commands=['rules'])
 def cmd_rules(message):
     uid = message.from_user.id
-    all_users.add(uid)
-    if uid not in user_langs: user_langs[uid] = 'ru'
-    save_db()
+    add_all_user(uid)
     bot.send_message(uid, t(uid, 'rules'), parse_mode='HTML')
 
 @bot.message_handler(commands=['join'])
 def cmd_join(message):
     uid = message.from_user.id
-    all_users.add(uid)
-    if uid not in user_langs: user_langs[uid] = 'ru'
-    
+    add_all_user(uid)
     if uid in joined_users:
         bot.send_message(uid, t(uid, 'join_already', count=len(joined_users)), parse_mode='HTML')
     else:
         joined_users.add(uid)
-        save_db()
+        save_session_db()
         bot.send_message(uid, t(uid, 'join_success', count=len(joined_users)), parse_mode='HTML')
         notify_others(uid, t(uid, 'notify_join', count=len(joined_users)), t(uid, 'notify_join', count=len(joined_users)))
 
 @bot.message_handler(commands=['exit'])
 def cmd_exit(message):
     uid = message.from_user.id
-    all_users.add(uid)
-    if uid not in user_langs: user_langs[uid] = 'ru'
-    
+    add_all_user(uid)
     if uid not in joined_users:
         bot.send_message(uid, t(uid, 'exit_already', count=len(joined_users)), parse_mode='HTML')
     else:
-        joined_users.remove(uid)
-        save_db()
+        joined_users.discard(uid)
+        save_session_db()
         bot.send_message(uid, t(uid, 'exit_success', count=len(joined_users)), parse_mode='HTML')
         notify_others(uid, t(uid, 'notify_exit', count=len(joined_users)), t(uid, 'notify_exit', count=len(joined_users)))
 
@@ -466,7 +505,6 @@ def cmd_check(message):
     if not message.reply_to_message:
         bot.send_message(uid, t(uid, 'check_sys'), parse_mode='HTML')
         return
-    
     target = message.reply_to_message.message_id
     if (uid, target) in msg_relations:
         bot.send_message(uid, t(uid, 'check_user'), parse_mode='HTML')
@@ -477,25 +515,17 @@ def cmd_check(message):
 def handle_any(message):
     if message.chat.type != 'private': return
     if message.text and message.text.startswith('/'): return
-
     uid = message.from_user.id
-    all_users.add(uid)
-    if uid not in user_langs:
-        user_langs[uid] = 'ru'
-        save_db()
-
+    add_all_user(uid)
     if uid not in joined_users:
         bot.send_message(uid, t(uid, 'err_not_joined'), parse_mode='HTML')
         return
-
     if is_spamming(uid):
         bot.send_message(uid, t(uid, 'err_spam'), parse_mode='HTML')
         return
-
     parent_thread_id = None
     if message.reply_to_message:
         parent_thread_id = msg_to_thread.get((uid, message.reply_to_message.message_id))
-
     threading.Thread(target=broadcast_message, args=(message, uid, parent_thread_id), daemon=True).start()
 
 @bot.edited_message_handler(content_types=['text', 'photo', 'video', 'document', 'audio'])
@@ -503,10 +533,8 @@ def handle_edit(message):
     if message.chat.type != 'private': return
     uid = message.from_user.id
     if uid not in joined_users: return
-
     key = (uid, message.message_id)
     if key not in user_messages: return
-
     relations = user_messages[key]
     fwd = is_forwarded(message)
     fwd_prefix = t(uid, 'forwarded')
@@ -522,16 +550,17 @@ def handle_edit(message):
             if ents:
                 lim = utf16_len(orig_text)
                 ents = [e for e in ents if e.offset + e.length <= lim]
-        
         for r_id, b_id in relations:
-            edit_sfx = "\n\n" + t(r_id, 'edited')
+            edit_word = t(r_id, 'edited')
+            edit_sfx = "\n\n" + edit_word
             new_text = orig_text + edit_sfx
             offset = utf16_len(orig_text) + 2
             e_copy = list(ents)
-            e_copy.append(types.MessageEntity(type='bold', offset=offset, length=utf16_len(t(r_id, 'edited'))))
-            
+            e_copy.append(types.MessageEntity(type='bold', offset=offset, length=utf16_len(edit_word)))
             def edit_task(target_uid=r_id, msg_id=b_id, txt=new_text, e=e_copy):
                 try: bot.edit_message_text(txt, chat_id=target_uid, message_id=msg_id, entities=e)
+                except ApiTelegramException as err:
+                    if err.error_code == 403: remove_dead_user(target_uid)
                 except Exception: pass
             executor.submit(edit_task)
     else:
@@ -545,16 +574,17 @@ def handle_edit(message):
             if ents:
                 lim = utf16_len(orig_cap)
                 ents = [e for e in ents if e.offset + e.length <= lim]
-        
         for r_id, b_id in relations:
-            edit_sfx = "\n\n" + t(r_id, 'edited')
+            edit_word = t(r_id, 'edited')
+            edit_sfx = "\n\n" + edit_word
             new_cap = orig_cap + edit_sfx
             offset = utf16_len(orig_cap) + 2
             e_copy = list(ents)
-            e_copy.append(types.MessageEntity(type='bold', offset=offset, length=utf16_len(t(r_id, 'edited'))))
-            
+            e_copy.append(types.MessageEntity(type='bold', offset=offset, length=utf16_len(edit_word)))
             def edit_media(target_uid=r_id, msg_id=b_id, cap=new_cap, e=e_copy):
                 try: bot.edit_message_caption(chat_id=target_uid, message_id=msg_id, caption=cap, caption_entities=e)
+                except ApiTelegramException as err:
+                    if err.error_code == 403: remove_dead_user(target_uid)
                 except Exception: pass
             executor.submit(edit_media)
 
@@ -563,22 +593,16 @@ def handle_reaction(reaction):
     if not reaction.user: return
     uid = reaction.user.id
     if uid not in joined_users: return
-
     key = (uid, reaction.message_id)
     if key not in msg_relations: return
-
     author_id, orig_msg_id = msg_relations[key]
     old_emojis = {r.emoji for r in reaction.old_reaction if getattr(r, 'type', '') == 'emoji'}
     new_emojis = {r.emoji for r in reaction.new_reaction if getattr(r, 'type', '') == 'emoji'}
     added = new_emojis - old_emojis
-
     if not added: return
-
     emoji = list(added)[0]
-    
     if author_id != uid:
         executor.submit(send_text_safe, author_id, t(author_id, 'reaction', emoji=emoji), reply_to=orig_msg_id, sys_msg=True)
-
     relations = user_messages.get((author_id, orig_msg_id), [])
     for r_id, b_id in relations:
         if r_id != uid:
@@ -591,28 +615,23 @@ def channel_stats_loop(bot_username):
         channel_id = int(CHANNEL) if str(CHANNEL).startswith('-100') else CHANNEL
     except ValueError:
         channel_id = CHANNEL
-
     while True:
         try:
             now_utc = datetime.now(timezone.utc)
             current_date = now_utc.date()
             count = len(joined_users)
-            
             recreate = False
             if last_stats_date != current_date:
                 recreate = True
                 last_stats_date = current_date
             elif count != last_stats_count:
                 recreate = False
-                
             if recreate or count != last_stats_count:
                 text = t('ru', 'stats').format(count=count, botname=bot_username)
-                
                 if recreate and stats_msg_id:
                     try: bot.delete_message(channel_id, stats_msg_id)
                     except Exception: pass
                     stats_msg_id = None
-
                 if not stats_msg_id:
                     msg = bot.send_message(channel_id, text, parse_mode='HTML')
                     stats_msg_id = msg.message_id
@@ -622,7 +641,6 @@ def channel_stats_loop(bot_username):
                     except Exception:
                         msg = bot.send_message(channel_id, text, parse_mode='HTML')
                         stats_msg_id = msg.message_id
-                
                 last_stats_count = count
         except Exception:
             pass
@@ -633,7 +651,6 @@ if __name__ == "__main__":
     bot.remove_webhook()
     me = bot.get_me()
     BOT_ID = me.id
-    
     commands_ru = [
         types.BotCommand("start", "Начать"),
         types.BotCommand("join", "Зайти в чат"),
@@ -644,7 +661,6 @@ if __name__ == "__main__":
         types.BotCommand("online", "Кто в сети"),
         types.BotCommand("check", "Проверить сообщение")
     ]
-    
     commands_en = [
         types.BotCommand("start", "Start"),
         types.BotCommand("join", "Join chat"),
@@ -655,7 +671,6 @@ if __name__ == "__main__":
         types.BotCommand("online", "Who is online"),
         types.BotCommand("check", "Check message")
     ]
-    
     try:
         bot.set_my_commands(commands_ru, language_code='ru')
         bot.set_my_commands(commands_en, language_code='en')
@@ -668,11 +683,10 @@ if __name__ == "__main__":
             try:
                 bot.send_message(u, t(u, 'restarted'), parse_mode='HTML')
                 time.sleep(0.05)
-            except Exception:
-                pass
-            
+            except ApiTelegramException as e:
+                if e.error_code == 403: remove_dead_user(u)
+            except Exception: pass
     threading.Thread(target=restart_notify, daemon=True).start()
     threading.Thread(target=channel_stats_loop, args=(me.username,), daemon=True).start()
-    
     print("[start] Bot is running", flush=True)
     bot.infinity_polling(timeout=30, long_polling_timeout=25, allowed_updates=['message', 'edited_message', 'message_reaction', 'callback_query'])
