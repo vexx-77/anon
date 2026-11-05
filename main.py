@@ -548,6 +548,8 @@ def process_album(gid):
                     media.append(types.InputMediaVideo(m.video.file_id, caption=cap, caption_entities=cap_ent, has_spoiler=has_spoiler))
                 elif ct == 'document':
                     media.append(types.InputMediaDocument(m.document.file_id, caption=cap, caption_entities=cap_ent))
+                elif ct == 'audio':
+                    media.append(types.InputMediaAudio(m.audio.file_id, caption=cap, caption_entities=cap_ent, title=getattr(m.audio, 'title', None), performer=getattr(m.audio, 'performer', None)))
                     
             if not media: continue
             
@@ -615,7 +617,7 @@ def cmd_say(message):
         if m: msg_ids[u] = m.message_id
         
     threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids}
-    bot.send_message(uid, f"Разослано: {len(targets)}")
+    bot.send_message(uid, f"Разослано: {len(targets)}", disable_web_page_preview=True)
 
 @bot.message_handler(commands=['sms'])
 def cmd_sms(message):
@@ -645,7 +647,7 @@ def cmd_sms(message):
         if m: msg_ids[u] = m.message_id
         
     threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids}
-    bot.send_message(uid, f"Разослано в сессию: {len(targets)}")
+    bot.send_message(uid, f"Разослано в сессию: {len(targets)}", disable_web_page_preview=True)
 
 @bot.message_handler(commands=['lang'])
 def cmd_lang(message):
@@ -653,14 +655,14 @@ def cmd_lang(message):
     add_all_user(uid)
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(types.InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru"), types.InlineKeyboardButton("🇬🇧 English", callback_data="lang_en"))
-    bot.send_message(uid, t(uid, 'lang_select'), reply_markup=markup)
+    bot.send_message(uid, t(uid, 'lang_select'), reply_markup=markup, disable_web_page_preview=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('lang_'))
 def callback_lang(call):
     uid = call.from_user.id
     lang = call.data.split('_')[1]
     set_user_lang(uid, lang)
-    bot.edit_message_text(chat_id=uid, message_id=call.message.message_id, text=t(uid, 'lang_set'), parse_mode='HTML')
+    bot.edit_message_text(chat_id=uid, message_id=call.message.message_id, text=t(uid, 'lang_set'), parse_mode='HTML', disable_web_page_preview=True)
 
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
@@ -715,7 +717,7 @@ def cmd_exit(message):
 def cmd_online(message):
     uid = message.from_user.id
     if uid not in joined_users: return
-    m = send_system_message(uid, 'bot', t(uid, 'online', count=len(joined_users)), auto_del=True)
+    send_system_message(uid, 'bot', t(uid, 'online', count=len(joined_users)), auto_del=True)
 
 @bot.message_handler(commands=['check'])
 def cmd_check(message):
@@ -859,19 +861,22 @@ def handle_reaction(reaction):
     
     sys_thread_id = uuid.uuid4().hex
     msg_ids = {}
-    
-    if author_id != uid:
-        body_auth = t(author_id, 'reaction_body', emoji=emoji)
-        m = send_system_message(author_id, 'reaction_pfx', body_auth, reply_to=orig_msg_id, thread_id=sys_thread_id)
-        if m: msg_ids[author_id] = m.message_id
-        
     relations = user_messages.get((author_id, orig_msg_id), [])
-    for r_id, b_id in relations:
-        if r_id != uid and r_id != author_id:
-            body_other = t(r_id, 'reaction_body', emoji=emoji)
-            m2 = send_system_message(r_id, 'reaction_pfx', body_other, reply_to=b_id, thread_id=sys_thread_id)
-            if m2: msg_ids[r_id] = m2.message_id
-            
+    
+    for u in list(joined_users):
+        r_to = None
+        if u == author_id:
+            r_to = orig_msg_id
+        else:
+            for r_id, b_id in relations:
+                if r_id == u:
+                    r_to = b_id
+                    break
+                    
+        body_other = t(u, 'reaction_body', emoji=emoji)
+        m = send_system_message(u, 'reaction_pfx', body_other, reply_to=r_to, thread_id=sys_thread_id)
+        if m: msg_ids[u] = m.message_id
+        
     if msg_ids:
         threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids}
 
