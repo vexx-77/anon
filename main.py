@@ -76,18 +76,21 @@ TEXTS = {
         'join_success': "<b>Ты зашел в чат.</b>\nСейчас тут: {count}",
         'exit_already': "<b>Ты и так не в чате.</b>\nСейчас тут: {count}",
         'exit_success': "<b>Ты вышел из чата.</b>\nСейчас тут: {count}",
-        'notify_join': "<b>[бот]</b>\nКто-то зашел в чат. Сейчас тут: {count}",
-        'notify_exit': "<b>[бот]</b>\nКто-то вышел из чата. Сейчас тут: {count}",
-        'restarted': "<b>[бот]</b>\nБот перезапущен. Ты остаешься в чате.",
+        'notify_join': "Кто-то зашел в чат. Сейчас тут: {count}",
+        'notify_exit': "Кто-то вышел из чата. Сейчас тут: {count}",
+        'restarted': "Бот перезапущен. Ты остаешься в чате.",
         'lang_select': "Выбери язык / Select language:",
         'lang_set': "<b>Язык изменен на русский.</b>",
-        'reaction': "<b>[реакция]</b>\n+ {emoji}",
-        'online': "<b>[бот]</b>\nСейчас в сети: {count}",
-        'check_user': "<b>[бот]</b>\nЭто сообщение пользователя.",
-        'check_sys': "<b>[бот]</b>\nЭто системное сообщение бота.",
+        'online': "Сейчас в сети: {count}",
+        'check_user': "Это сообщение пользователя.",
+        'check_sys': "Это системное сообщение бота.",
         'stats': "Пользователей в сессии: {count}\nБот: @{botname}\n(Сообщение обновляется автоматически)\n\nUsers in session: {count}\nBot: @{botname}\n(Message updates automatically)",
         'forwarded': "[переслано]",
         'edited': "[изменено]",
+        'bot': "[бот]",
+        'reaction_pfx': "[реакция]",
+        'reaction_body': "+ {emoji}",
+        'admin': "[админ]",
         'announcement': "[объявление]"
     },
     'en': {
@@ -102,18 +105,21 @@ TEXTS = {
         'join_success': "<b>You joined the chat.</b>\nCurrently online: {count}",
         'exit_already': "<b>You are not in the chat.</b>\nCurrently online: {count}",
         'exit_success': "<b>You left the chat.</b>\nCurrently online: {count}",
-        'notify_join': "<b>[bot]</b>\nSomeone joined the chat. Currently online: {count}",
-        'notify_exit': "<b>[bot]</b>\nSomeone left the chat. Currently online: {count}",
-        'restarted': "<b>[bot]</b>\nBot restarted. You are still in the chat.",
+        'notify_join': "Someone joined the chat. Currently online: {count}",
+        'notify_exit': "Someone left the chat. Currently online: {count}",
+        'restarted': "Bot restarted. You are still in the chat.",
         'lang_select': "Выбери язык / Select language:",
         'lang_set': "<b>Language changed to English.</b>",
-        'reaction': "<b>[reaction]</b>\n+ {emoji}",
-        'online': "<b>[bot]</b>\nCurrently online: {count}",
-        'check_user': "<b>[bot]</b>\nThis is a user message.",
-        'check_sys': "<b>[bot]</b>\nThis is a system message.",
+        'online': "Currently online: {count}",
+        'check_user': "This is a user message.",
+        'check_sys': "This is a system message.",
         'stats': "Пользователей в сессии: {count}\nБот: @{botname}\n(Сообщение обновляется автоматически)\n\nUsers in session: {count}\nBot: @{botname}\n(Message updates automatically)",
         'forwarded': "[forwarded]",
         'edited': "[edited]",
+        'bot': "[bot]",
+        'reaction_pfx': "[reaction]",
+        'reaction_body': "+ {emoji}",
+        'admin': "[admin]",
         'announcement': "[announcement]"
     }
 }
@@ -302,6 +308,74 @@ def fit_text_with_forward(text, entities, max_len, prefix):
         entities = [e for e in entities if e.offset + e.length <= lim]
     return prepend_forwarded(text, entities, prefix)
 
+def _get_animated_prefix(pfx, tick):
+    if tick % 2 == 0:
+        return pfx
+    if pfx.startswith("[") and pfx.endswith("]"):
+        return "[ " + pfx[1:-1] + " ]"
+    return pfx
+
+def animate_prefix(uid, msg_id, body_text, body_entities, pfx_key, base_shift):
+    pfx = t(uid, pfx_key)
+    for tick in range(1, 5):
+        time.sleep(1.0)
+        new_pfx = _get_animated_prefix(pfx, tick)
+        new_shift = utf16_len(new_pfx + "\n")
+        diff = new_shift - base_shift
+        
+        new_ents = [types.MessageEntity(type='bold', offset=0, length=utf16_len(new_pfx))]
+        if body_entities:
+            for e in body_entities:
+                ne = types.MessageEntity(type=e.type, offset=e.offset + diff, length=e.length)
+                if getattr(e, 'url', None): ne.url = e.url
+                if getattr(e, 'user', None): ne.user = e.user
+                if getattr(e, 'language', None): ne.language = e.language
+                if getattr(e, 'custom_emoji_id', None): ne.custom_emoji_id = e.custom_emoji_id
+                new_ents.append(ne)
+                
+        full_text = new_pfx + "\n" + body_text
+        try:
+            bot.edit_message_text(full_text, chat_id=uid, message_id=msg_id, entities=new_ents)
+        except Exception:
+            break
+
+def send_system_message(uid, pfx_key, body_text, body_entities=None, reply_to=None, auto_del=False, thread_id=None):
+    pfx = t(uid, pfx_key)
+    pfx_full = pfx + "\n"
+    shift = utf16_len(pfx_full)
+    
+    new_ents = [types.MessageEntity(type='bold', offset=0, length=utf16_len(pfx))]
+    if body_entities:
+        for e in body_entities:
+            ne = types.MessageEntity(type=e.type, offset=e.offset + shift, length=e.length)
+            if getattr(e, 'url', None): ne.url = e.url
+            if getattr(e, 'user', None): ne.user = e.user
+            if getattr(e, 'language', None): ne.language = e.language
+            if getattr(e, 'custom_emoji_id', None): ne.custom_emoji_id = e.custom_emoji_id
+            new_ents.append(ne)
+            
+    full_text = pfx_full + body_text
+    try:
+        m = bot.send_message(uid, full_text, entities=new_ents, reply_to_message_id=reply_to)
+        if auto_del:
+            auto_delete_msg(uid, m.message_id)
+            
+        threading.Thread(
+            target=animate_prefix, 
+            args=(uid, m.message_id, body_text, body_entities, pfx_key, shift), 
+            daemon=True
+        ).start()
+        
+        if thread_id:
+            add_to_od(msg_to_thread, (uid, m.message_id), thread_id, 50000)
+            
+        return m
+    except ApiTelegramException as e:
+        if e.error_code == 403: remove_dead_user(uid)
+        return None
+    except Exception:
+        return None
+
 def send_text_safe(uid, text, entities=None, reply_to=None, sys_msg=False, auto_del=False, lpo=None):
     try:
         kw = {}
@@ -417,11 +491,22 @@ def broadcast_message(message, sender_id, parent_thread_id=None):
                     add_to_od(msg_to_thread, (uid, m.message_id), new_thread_id, 50000)
             except Exception: pass
         user_messages[(sender_id, message.message_id)] = sent_relations
-        threads[new_thread_id] = {
-            "author_id": sender_id,
-            "original_msg_id": message.message_id,
-            "msg_ids": new_msg_ids
-        }
+        
+        p_thread = threads.get(parent_thread_id) if parent_thread_id else None
+        if p_thread and p_thread.get("author_id") == 0:
+            # Ответ на системное сообщение, привязываем к той же ветке или создаем новую?
+            # Создаем новую ветку, но чтобы реплаи шли друг другу, сохраняем msg_ids.
+            threads[new_thread_id] = {
+                "author_id": sender_id,
+                "original_msg_id": message.message_id,
+                "msg_ids": new_msg_ids
+            }
+        else:
+            threads[new_thread_id] = {
+                "author_id": sender_id,
+                "original_msg_id": message.message_id,
+                "msg_ids": new_msg_ids
+            }
         while len(threads) > 50000:
             threads.popitem(last=False)
     except Exception: pass
@@ -505,11 +590,15 @@ def process_album(gid):
             threads.popitem(last=False)
     except Exception: pass
 
-def notify_others(sender_id, text_ru, text_en):
+def notify_others(sender_id, body_ru, body_en):
+    sys_thread_id = uuid.uuid4().hex
+    msg_ids = {}
     for u in list(joined_users):
         if u != sender_id:
-            txt = text_ru if user_langs.get(u, 'ru') == 'ru' else text_en
-            executor.submit(send_text_safe, u, txt, sys_msg=True, auto_del=True)
+            txt = body_ru if user_langs.get(u, 'ru') == 'ru' else body_en
+            m = send_system_message(u, 'bot', txt, auto_del=True, thread_id=sys_thread_id)
+            if m: msg_ids[u] = m.message_id
+    threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids}
 
 @bot.message_handler(commands=['say'])
 def cmd_say(message):
@@ -531,21 +620,45 @@ def cmd_say(message):
                 ents.append(ne)
     with db_lock:
         targets = [u for u in user_langs.keys() if u != uid]
-    def _send(target_uid):
-        pfx = t(target_uid, 'announcement') + "\n"
-        shift = utf16_len(pfx)
-        new_ents = [types.MessageEntity(type='bold', offset=0, length=shift - 1)]
-        for e in ents:
-            ne = types.MessageEntity(type=e.type, offset=e.offset + shift, length=e.length)
-            if getattr(e, 'url', None): ne.url = e.url
-            if getattr(e, 'user', None): ne.user = e.user
-            if getattr(e, 'language', None): ne.language = e.language
-            if getattr(e, 'custom_emoji_id', None): ne.custom_emoji_id = e.custom_emoji_id
-            new_ents.append(ne)
-        send_text_safe(target_uid, pfx + orig_text, entities=new_ents, sys_msg=False)
+        
+    sys_thread_id = uuid.uuid4().hex
+    msg_ids = {}
     for u in targets:
-        executor.submit(_send, u)
+        m = send_system_message(u, 'announcement', orig_text, ents, thread_id=sys_thread_id)
+        if m: msg_ids[u] = m.message_id
+        
+    threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids}
     bot.send_message(uid, f"Разослано: {len(targets)}")
+
+@bot.message_handler(commands=['sms'])
+def cmd_sms(message):
+    uid = message.from_user.id
+    if uid != ADMIN: return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2: return
+    offset = len(parts[0]) + 1
+    orig_text = parts[1]
+    ents = []
+    if message.entities:
+        for e in message.entities:
+            if e.offset >= offset:
+                ne = types.MessageEntity(type=e.type, offset=e.offset - offset, length=e.length)
+                if getattr(e, 'url', None): ne.url = e.url
+                if getattr(e, 'user', None): ne.user = e.user
+                if getattr(e, 'language', None): ne.language = e.language
+                if getattr(e, 'custom_emoji_id', None): ne.custom_emoji_id = e.custom_emoji_id
+                ents.append(ne)
+    with db_lock:
+        targets = [u for u in joined_users if u != uid]
+        
+    sys_thread_id = uuid.uuid4().hex
+    msg_ids = {}
+    for u in targets:
+        m = send_system_message(u, 'admin', orig_text, ents, thread_id=sys_thread_id)
+        if m: msg_ids[u] = m.message_id
+        
+    threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids}
+    bot.send_message(uid, f"Разослано в сессию: {len(targets)}")
 
 @bot.message_handler(commands=['lang'])
 def cmd_lang(message):
@@ -594,7 +707,7 @@ def cmd_join(message):
     else:
         save_session_db()
         bot.send_message(uid, t(uid, 'join_success', count=len(joined_users)), parse_mode='HTML')
-        notify_others(uid, t(uid, 'notify_join', count=len(joined_users)), t(uid, 'notify_join', count=len(joined_users)))
+        notify_others(uid, t('ru', 'notify_join', count=len(joined_users)), t('en', 'notify_join', count=len(joined_users)))
 
 @bot.message_handler(commands=['exit'])
 def cmd_exit(message):
@@ -609,27 +722,26 @@ def cmd_exit(message):
     else:
         save_session_db()
         bot.send_message(uid, t(uid, 'exit_success', count=len(joined_users)), parse_mode='HTML')
-        notify_others(uid, t(uid, 'notify_exit', count=len(joined_users)), t(uid, 'notify_exit', count=len(joined_users)))
+        notify_others(uid, t('ru', 'notify_exit', count=len(joined_users)), t('en', 'notify_exit', count=len(joined_users)))
 
 @bot.message_handler(commands=['online'])
 def cmd_online(message):
     uid = message.from_user.id
     if uid not in joined_users: return
-    msg = bot.send_message(uid, t(uid, 'online', count=len(joined_users)), parse_mode='HTML')
-    auto_delete_msg(uid, msg.message_id)
+    m = send_system_message(uid, 'bot', t(uid, 'online', count=len(joined_users)), auto_del=True)
 
 @bot.message_handler(commands=['check'])
 def cmd_check(message):
     uid = message.from_user.id
     if uid not in joined_users: return
     if not message.reply_to_message:
-        bot.send_message(uid, t(uid, 'check_sys'), parse_mode='HTML')
+        send_system_message(uid, 'bot', t(uid, 'check_sys'), auto_del=True)
         return
     target = message.reply_to_message.message_id
     if (uid, target) in msg_relations:
-        bot.send_message(uid, t(uid, 'check_user'), parse_mode='HTML')
+        send_system_message(uid, 'bot', t(uid, 'check_user'), auto_del=True)
     else:
-        bot.send_message(uid, t(uid, 'check_sys'), parse_mode='HTML')
+        send_system_message(uid, 'bot', t(uid, 'check_sys'), auto_del=True)
 
 @bot.message_handler(content_types=['text', 'photo', 'video', 'document', 'audio', 'sticker', 'animation', 'voice', 'video_note'])
 def handle_any(message):
@@ -735,12 +847,24 @@ def handle_reaction(reaction):
     added = new_emojis - old_emojis
     if not added: return
     emoji = list(added)[0]
+    
+    sys_thread_id = uuid.uuid4().hex
+    msg_ids = {}
+    
     if author_id != uid:
-        executor.submit(send_text_safe, author_id, t(author_id, 'reaction', emoji=emoji), reply_to=orig_msg_id, sys_msg=True)
+        body_auth = t(author_id, 'reaction_body', emoji=emoji)
+        m = send_system_message(author_id, 'reaction_pfx', body_auth, reply_to=orig_msg_id, thread_id=sys_thread_id)
+        if m: msg_ids[author_id] = m.message_id
+        
     relations = user_messages.get((author_id, orig_msg_id), [])
     for r_id, b_id in relations:
-        if r_id != uid:
-            executor.submit(send_text_safe, r_id, t(r_id, 'reaction', emoji=emoji), reply_to=b_id, sys_msg=True)
+        if r_id != uid and r_id != author_id:
+            body_other = t(r_id, 'reaction_body', emoji=emoji)
+            m2 = send_system_message(r_id, 'reaction_pfx', body_other, reply_to=b_id, thread_id=sys_thread_id)
+            if m2: msg_ids[r_id] = m2.message_id
+            
+    if msg_ids:
+        threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids}
 
 def channel_stats_loop(bot_username):
     global stats_msg_id, last_stats_count, last_stats_date
@@ -818,12 +942,7 @@ if __name__ == "__main__":
 
     def restart_notify():
         for u in list(joined_users):
-            try:
-                bot.send_message(u, t(u, 'restarted'), parse_mode='HTML')
-                time.sleep(0.05)
-            except ApiTelegramException as e:
-                if e.error_code == 403: remove_dead_user(u)
-            except Exception: pass
+            m = send_system_message(u, 'bot', t(u, 'restarted'))
             
     threading.Thread(target=restart_notify, daemon=True).start()
     threading.Thread(target=channel_stats_loop, args=(me.username,), daemon=True).start()
