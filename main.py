@@ -42,6 +42,9 @@ msg_relations = OrderedDict()
 threads = OrderedDict()
 msg_to_thread = OrderedDict()
 
+media_group_buffer = {}
+media_group_lock = threading.Lock()
+
 msg_counter = {}
 SPAM_LIMIT = 20
 SPAM_WINDOW = 60.0
@@ -164,7 +167,6 @@ def compact_users_log():
 
 def load_db():
     os.makedirs(DB_DIR, exist_ok=True)
-
     if os.path.exists(OLD_USERS_JSON):
         try:
             with open(OLD_USERS_JSON) as f:
@@ -176,8 +178,7 @@ def load_db():
             save_session_db()
             os.rename(OLD_USERS_JSON, OLD_USERS_JSON + ".bak")
         except Exception as e:
-            print(f"Migration (users.json) error: {e}", flush=True)
-
+            print(f"Migration error: {e}", flush=True)
     if os.path.exists(OLD_ALL_JSON):
         try:
             with open(OLD_ALL_JSON) as f:
@@ -188,20 +189,16 @@ def load_db():
                 user_langs[dec_id(e)] = 'en'
             os.rename(OLD_ALL_JSON, OLD_ALL_JSON + ".bak")
         except Exception as e:
-            print(f"Migration (all_users.json) error: {e}", flush=True)
-
+            print(f"Migration error: {e}", flush=True)
     if os.path.exists(LOG_FILE):
         try:
             with open(LOG_FILE) as f:
                 for line in f:
                     parts = line.strip().split()
-                    if len(parts) != 2:
-                        continue
+                    if len(parts) != 2: continue
                     enc, lang = parts
-                    try:
-                        uid = dec_id(enc)
-                    except Exception:
-                        continue
+                    try: uid = dec_id(enc)
+                    except Exception: continue
                     if lang == '-':
                         user_langs.pop(uid, None)
                         joined_users.discard(uid)
@@ -209,7 +206,6 @@ def load_db():
                         user_langs[uid] = lang
         except Exception as e:
             print(f"Log load error: {e}", flush=True)
-
     if os.path.exists(SESSION_FILE):
         try:
             with open(SESSION_FILE) as f:
@@ -221,29 +217,25 @@ def load_db():
                     user_langs[uid] = 'ru'
         except Exception as e:
             print(f"Session load error: {e}", flush=True)
-
     compact_users_log()
     save_session_db()
 
 def add_all_user(uid, lang=None):
     with db_lock:
-        if uid in user_langs:
-            return
+        if uid in user_langs: return
         new_lang = lang or 'ru'
         user_langs[uid] = new_lang
         _append_log(uid, new_lang)
 
 def set_user_lang(uid, lang):
     with db_lock:
-        if user_langs.get(uid) == lang:
-            return
+        if user_langs.get(uid) == lang: return
         user_langs[uid] = lang
         _append_log(uid, lang)
 
 def remove_dead_user(uid):
     with db_lock:
-        if uid not in user_langs:
-            return
+        if uid not in user_langs: return
         joined_users.discard(uid)
         del user_langs[uid]
         _append_log(uid, '-')
@@ -272,10 +264,8 @@ def get_user_lock(uid):
 
 def auto_delete_msg(chat_id, message_id, delay=5.0):
     def _del():
-        try:
-            bot.delete_message(chat_id, message_id)
-        except Exception:
-            pass
+        try: bot.delete_message(chat_id, message_id)
+        except Exception: pass
     threading.Timer(delay, _del).start()
 
 def is_forwarded(msg):
@@ -289,8 +279,7 @@ def is_forwarded(msg):
 def prepend_forwarded(text, entities, prefix):
     new_text = prefix + "\n" + (text or '')
     shift = utf16_len(prefix + "\n")
-    if not entities:
-        return new_text, None
+    if not entities: return new_text, None
     new_ents = []
     for e in entities:
         ne = types.MessageEntity(type=e.type, offset=e.offset + shift, length=e.length)
@@ -302,8 +291,7 @@ def prepend_forwarded(text, entities, prefix):
     return new_text, new_ents
 
 def fit_text_with_forward(text, entities, max_len, prefix):
-    if not text:
-        return prefix, None
+    if not text: return prefix, None
     if utf16_len(text) + utf16_len(prefix) + 1 <= max_len:
         return prepend_forwarded(text, entities, prefix)
     avail = max_len - utf16_len(prefix) - 1
@@ -322,12 +310,10 @@ def send_text_safe(uid, text, entities=None, reply_to=None, sys_msg=False, auto_
             m = bot.send_message(uid, text, parse_mode='HTML', reply_to_message_id=reply_to, **kw)
         else:
             m = bot.send_message(uid, text, entities=entities, reply_to_message_id=reply_to, **kw)
-        if auto_del and m:
-            auto_delete_msg(uid, m.message_id)
+        if auto_del and m: auto_delete_msg(uid, m.message_id)
         return m
     except ApiTelegramException as e:
-        if e.error_code == 403:
-            remove_dead_user(uid)
+        if e.error_code == 403: remove_dead_user(uid)
         return None
     except Exception:
         return None
@@ -350,19 +336,20 @@ def send_media_task(uid, ct, msg, reply_to, fwd=False):
                 if utf16_len(caption) > MAX_CAPTION:
                     caption = caption[:MAX_CAPTION]
                     cap_ent = None
+            
+            has_spoiler = getattr(msg, 'has_media_spoiler', False)
+            
             if ct == 'photo':
-                m = bot.send_photo(uid, msg.photo[-1].file_id, caption=caption, caption_entities=cap_ent, reply_to_message_id=reply_to)
+                m = bot.send_photo(uid, msg.photo[-1].file_id, caption=caption, caption_entities=cap_ent, reply_to_message_id=reply_to, has_spoiler=has_spoiler)
             elif ct == 'video':
-                m = bot.send_video(uid, msg.video.file_id, caption=caption, caption_entities=cap_ent, reply_to_message_id=reply_to)
+                m = bot.send_video(uid, msg.video.file_id, caption=caption, caption_entities=cap_ent, reply_to_message_id=reply_to, has_spoiler=has_spoiler)
             elif ct == 'document':
                 m = bot.send_document(uid, msg.document.file_id, caption=caption, caption_entities=cap_ent, reply_to_message_id=reply_to)
             elif ct == 'audio':
                 m = bot.send_audio(uid, msg.audio.file_id, caption=caption, caption_entities=cap_ent, reply_to_message_id=reply_to)
         except ApiTelegramException as e:
-            if e.error_code == 403:
-                remove_dead_user(uid)
-        except Exception:
-            pass
+            if e.error_code == 403: remove_dead_user(uid)
+        except Exception: pass
         last_media_time[uid] = time.time()
         return m
 
@@ -391,17 +378,15 @@ def send_task_wrapper(uid, ct, msg, reply_to):
             if ct == 'sticker':
                 return bot.send_sticker(uid, msg.sticker.file_id, reply_to_message_id=reply_to)
             elif ct == 'animation':
-                return bot.send_animation(uid, msg.animation.file_id, reply_to_message_id=reply_to)
+                return bot.send_animation(uid, msg.animation.file_id, reply_to_message_id=reply_to, has_spoiler=getattr(msg, 'has_media_spoiler', False))
             elif ct == 'voice':
                 return bot.send_voice(uid, msg.voice.file_id, reply_to_message_id=reply_to)
             elif ct == 'video_note':
                 return bot.send_video_note(uid, msg.video_note.file_id, reply_to_message_id=reply_to)
         except ApiTelegramException as e:
-            if e.error_code == 403:
-                remove_dead_user(uid)
+            if e.error_code == 403: remove_dead_user(uid)
             return None
-        except Exception:
-            return None
+        except Exception: return None
 
 def broadcast_message(message, sender_id, parent_thread_id=None):
     try:
@@ -430,20 +415,95 @@ def broadcast_message(message, sender_id, parent_thread_id=None):
                     sent_relations.append((uid, m.message_id))
                     add_to_od(msg_relations, (uid, m.message_id), (sender_id, message.message_id), 50000)
                     add_to_od(msg_to_thread, (uid, m.message_id), new_thread_id, 50000)
-            except Exception:
-                pass
+            except Exception: pass
         user_messages[(sender_id, message.message_id)] = sent_relations
-        
         threads[new_thread_id] = {
             "author_id": sender_id,
             "original_msg_id": message.message_id,
             "msg_ids": new_msg_ids
         }
-        
         while len(threads) > 50000:
             threads.popitem(last=False)
-    except Exception:
-        pass
+    except Exception: pass
+
+def process_album(gid):
+    with media_group_lock:
+        if gid not in media_group_buffer: return
+        data = media_group_buffer.pop(gid)
+    msgs = data["messages"]
+    sender_id = data["sender_id"]
+    parent_thread_id = data["parent_thread_id"]
+    msgs.sort(key=lambda m: m.message_id)
+    
+    try:
+        new_thread_id = uuid.uuid4().hex
+        new_msg_ids = {}
+        targets = [u for u in joined_users if u != sender_id]
+        if not targets: return
+        
+        first_msg = msgs[0]
+        fwd = is_forwarded(first_msg)
+        
+        all_sent_relations = {m.message_id: [] for m in msgs}
+        
+        for uid in targets:
+            reply_to_id = None
+            if parent_thread_id and parent_thread_id in threads:
+                p_thread = threads[parent_thread_id]
+                if uid == p_thread["author_id"]:
+                    reply_to_id = p_thread["original_msg_id"]
+                else:
+                    reply_to_id = p_thread["msg_ids"].get(uid)
+                    
+            media = []
+            for i, m in enumerate(msgs):
+                ct = m.content_type
+                cap = m.caption or ''
+                cap_ent = m.caption_entities
+                
+                if i == 0 and fwd:
+                    prefix = t(uid, 'forwarded')
+                    cap, cap_ent = fit_text_with_forward(cap, cap_ent, MAX_CAPTION, prefix)
+                elif utf16_len(cap) > MAX_CAPTION:
+                    cap = cap[:MAX_CAPTION]
+                    cap_ent = None
+                    
+                has_spoiler = getattr(m, 'has_media_spoiler', False)
+                
+                if ct == 'photo':
+                    media.append(types.InputMediaPhoto(m.photo[-1].file_id, caption=cap, caption_entities=cap_ent, has_spoiler=has_spoiler))
+                elif ct == 'video':
+                    media.append(types.InputMediaVideo(m.video.file_id, caption=cap, caption_entities=cap_ent, has_spoiler=has_spoiler))
+                elif ct == 'document':
+                    media.append(types.InputMediaDocument(m.document.file_id, caption=cap, caption_entities=cap_ent))
+                    
+            if not media: continue
+            
+            try:
+                bot_msgs = bot.send_media_group(uid, media, reply_to_message_id=reply_to_id)
+                for idx, bm in enumerate(bot_msgs):
+                    if idx < len(msgs):
+                        orig_msg_id = msgs[idx].message_id
+                        all_sent_relations[orig_msg_id].append((uid, bm.message_id))
+                        add_to_od(msg_relations, (uid, bm.message_id), (sender_id, orig_msg_id), 50000)
+                        add_to_od(msg_to_thread, (uid, bm.message_id), new_thread_id, 50000)
+                if bot_msgs:
+                    new_msg_ids[uid] = bot_msgs[0].message_id
+            except ApiTelegramException as e:
+                if e.error_code == 403: remove_dead_user(uid)
+            except Exception: pass
+                
+        for orig_msg_id, rels in all_sent_relations.items():
+            user_messages[(sender_id, orig_msg_id)] = rels
+            
+        threads[new_thread_id] = {
+            "author_id": sender_id,
+            "original_msg_id": msgs[0].message_id,
+            "msg_ids": new_msg_ids
+        }
+        while len(threads) > 50000:
+            threads.popitem(last=False)
+    except Exception: pass
 
 def notify_others(sender_id, text_ru, text_en):
     for u in list(joined_users):
@@ -469,10 +529,8 @@ def cmd_say(message):
                 if getattr(e, 'language', None): ne.language = e.language
                 if getattr(e, 'custom_emoji_id', None): ne.custom_emoji_id = e.custom_emoji_id
                 ents.append(ne)
-
     with db_lock:
         targets = [u for u in user_langs.keys() if u != uid]
-
     def _send(target_uid):
         pfx = t(target_uid, 'announcement') + "\n"
         shift = utf16_len(pfx)
@@ -485,10 +543,8 @@ def cmd_say(message):
             if getattr(e, 'custom_emoji_id', None): ne.custom_emoji_id = e.custom_emoji_id
             new_ents.append(ne)
         send_text_safe(target_uid, pfx + orig_text, entities=new_ents, sys_msg=False)
-
     for u in targets:
         executor.submit(_send, u)
-
     bot.send_message(uid, f"Разослано: {len(targets)}")
 
 @bot.message_handler(commands=['lang'])
@@ -590,6 +646,20 @@ def handle_any(message):
     parent_thread_id = None
     if message.reply_to_message:
         parent_thread_id = msg_to_thread.get((uid, message.reply_to_message.message_id))
+        
+    if message.media_group_id:
+        gid = message.media_group_id
+        with media_group_lock:
+            if gid not in media_group_buffer:
+                media_group_buffer[gid] = {
+                    "messages": [],
+                    "sender_id": uid,
+                    "parent_thread_id": parent_thread_id
+                }
+                threading.Timer(1.0, process_album, args=(gid,)).start()
+            media_group_buffer[gid]["messages"].append(message)
+        return
+        
     threading.Thread(target=broadcast_message, args=(message, uid, parent_thread_id), daemon=True).start()
 
 @bot.edited_message_handler(content_types=['text', 'photo', 'video', 'document', 'audio'])
@@ -706,17 +776,14 @@ def channel_stats_loop(bot_username):
                         msg = bot.send_message(channel_id, text, parse_mode='HTML')
                         stats_msg_id = msg.message_id
                 last_stats_count = count
-        except Exception:
-            pass
+        except Exception: pass
         time.sleep(60)
 
 def compact_loop():
     while True:
         time.sleep(3600)
-        try:
-            compact_users_log()
-        except Exception:
-            pass
+        try: compact_users_log()
+        except Exception: pass
 
 if __name__ == "__main__":
     load_db()
@@ -747,8 +814,7 @@ if __name__ == "__main__":
         bot.set_my_commands(commands_ru, language_code='ru')
         bot.set_my_commands(commands_en, language_code='en')
         bot.set_my_commands(commands_en)
-    except Exception:
-        pass
+    except Exception: pass
 
     def restart_notify():
         for u in list(joined_users):
@@ -758,6 +824,7 @@ if __name__ == "__main__":
             except ApiTelegramException as e:
                 if e.error_code == 403: remove_dead_user(u)
             except Exception: pass
+            
     threading.Thread(target=restart_notify, daemon=True).start()
     threading.Thread(target=channel_stats_loop, args=(me.username,), daemon=True).start()
     threading.Thread(target=compact_loop, daemon=True).start()
