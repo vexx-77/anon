@@ -955,3 +955,4 @@ if __name__ == "__main__":
     threading.Thread(target=compact_loop, daemon=True).start()
     print("[start] Bot is running", flush=True)
     bot.infinity_polling(timeout=30, long_polling_timeout=25, allowed_updates=['message', 'edited_message', 'message_reaction', 'callback_query'])
+#end
