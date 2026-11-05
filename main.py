@@ -415,7 +415,11 @@ def broadcast_message(message, sender_id, parent_thread_id=None):
         for uid in targets:
             reply_to_id = None
             if parent_thread_id and parent_thread_id in threads:
-                reply_to_id = threads[parent_thread_id].get(uid)
+                p_thread = threads[parent_thread_id]
+                if uid == p_thread["author_id"]:
+                    reply_to_id = p_thread["original_msg_id"]
+                else:
+                    reply_to_id = p_thread["msg_ids"].get(uid)
             fut = executor.submit(send_task_wrapper, uid, ct, message, reply_to_id)
             futures.append((uid, fut))
         for uid, fut in futures:
@@ -429,7 +433,13 @@ def broadcast_message(message, sender_id, parent_thread_id=None):
             except Exception:
                 pass
         user_messages[(sender_id, message.message_id)] = sent_relations
-        threads[new_thread_id] = new_msg_ids
+        
+        threads[new_thread_id] = {
+            "author_id": sender_id,
+            "original_msg_id": message.message_id,
+            "msg_ids": new_msg_ids
+        }
+        
         while len(threads) > 50000:
             threads.popitem(last=False)
     except Exception:
