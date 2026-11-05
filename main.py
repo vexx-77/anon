@@ -834,6 +834,9 @@ def handle_reaction(reaction):
     if thread_id:
         p_thread = threads.get(thread_id)
         if p_thread and p_thread.get("author_id") == 0:
+            if p_thread.get("is_reaction"):
+                return
+                
             old_emojis = {r.emoji for r in reaction.old_reaction if getattr(r, 'type', '') == 'emoji'}
             new_emojis = {r.emoji for r in reaction.new_reaction if getattr(r, 'type', '') == 'emoji'}
             added = new_emojis - old_emojis
@@ -848,7 +851,7 @@ def handle_reaction(reaction):
                 m = send_system_message(u, 'reaction_pfx', body_other, reply_to=r_to, thread_id=sys_thread_id)
                 if m: msg_ids[u] = m.message_id
             if msg_ids:
-                threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids}
+                threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids, "is_reaction": True}
             return
 
     if key not in msg_relations: return
@@ -878,7 +881,7 @@ def handle_reaction(reaction):
         if m: msg_ids[u] = m.message_id
         
     if msg_ids:
-        threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids}
+        threads[sys_thread_id] = {"author_id": 0, "original_msg_id": None, "msg_ids": msg_ids, "is_reaction": True}
 
 def channel_stats_loop(bot_username):
     global stats_msg_id, last_stats_count, last_stats_date
@@ -955,4 +958,3 @@ if __name__ == "__main__":
     threading.Thread(target=compact_loop, daemon=True).start()
     print("[start] Bot is running", flush=True)
     bot.infinity_polling(timeout=30, long_polling_timeout=25, allowed_updates=['message', 'edited_message', 'message_reaction', 'callback_query'])
-#end
