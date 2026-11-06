@@ -15,8 +15,8 @@ from telebot.apihelper import ApiTelegramException
 
 TOKEN = os.environ.get("TOKEN")
 CHANNEL = os.environ.get("CHANNEL")
-ADMIN_STR = os.environ.get("ADMIN")
-ADMIN = int(ADMIN_STR) if ADMIN_STR else 0
+ADMIN_STR = os.environ.get("ADMIN", "")
+ADMINS = {int(x.strip()) for x in ADMIN_STR.split(",") if x.strip().lstrip("-").isdigit()}
 CHANNEL_LINK = "t.me/AnonGroupChat_channel"
 
 if not TOKEN:
@@ -46,9 +46,6 @@ msg_to_thread = OrderedDict()
 media_group_buffer = {}
 media_group_lock = threading.Lock()
 
-msg_counter = {}
-SPAM_LIMIT = 20
-SPAM_WINDOW = 60.0
 AFK_TIMEOUT = 86400.0
 
 MAX_TEXT = 4096
@@ -73,7 +70,6 @@ TEXTS = {
         'status_on': "В сети",
         'status_off': "Не в сети",
         'err_not_joined': "<b>Ошибка.</b>\nТы не в чате. Напиши /join.",
-        'err_spam': "<b>Ошибка.</b>\nСлишком много сообщений. Подожди минуту.",
         'join_already': "<b>Ты уже в чате.</b>\nСейчас тут: {count}",
         'join_success': "<b>Ты зашел в чат.</b>\nСейчас тут: {count}",
         'exit_already': "<b>Ты и так не в чате.</b>\nСейчас тут: {count}",
@@ -103,7 +99,6 @@ TEXTS = {
         'status_on': "Online",
         'status_off': "Offline",
         'err_not_joined': "<b>Error.</b>\nYou are not in the chat. Use /join.",
-        'err_spam': "<b>Error.</b>\nToo many messages. Wait a minute.",
         'join_already': "<b>You are already in the chat.</b>\nCurrently online: {count}",
         'join_success': "<b>You joined the chat.</b>\nCurrently online: {count}",
         'exit_already': "<b>You are not in the chat.</b>\nCurrently online: {count}",
@@ -257,13 +252,6 @@ def remove_dead_user(uid):
 
 def utf16_len(s):
     return len(s.encode("utf-16-le")) // 2
-
-def is_spamming(uid):
-    now = time.time()
-    times = [x for x in msg_counter.get(uid, []) if now - x < SPAM_WINDOW]
-    times.append(now)
-    msg_counter[uid] = times
-    return len(times) > SPAM_LIMIT
 
 def add_to_od(od, key, val, maxsize):
     od[key] = val
@@ -596,7 +584,7 @@ def notify_others(sender_id, body_ru, body_en):
 @bot.message_handler(commands=['say'])
 def cmd_say(message):
     uid = message.from_user.id
-    if uid != ADMIN: return
+    if uid not in ADMINS: return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2: return
     offset = len(parts[0]) + 1
@@ -625,7 +613,7 @@ def cmd_say(message):
 @bot.message_handler(commands=['sms'])
 def cmd_sms(message):
     uid = message.from_user.id
-    if uid != ADMIN: return
+    if uid not in ADMINS: return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2: return
     offset = len(parts[0]) + 1
@@ -744,9 +732,6 @@ def handle_any(message):
     add_all_user(uid)
     if uid not in joined_users:
         bot.send_message(uid, t(uid, 'err_not_joined'), parse_mode='HTML', disable_web_page_preview=True)
-        return
-    if is_spamming(uid):
-        bot.send_message(uid, t(uid, 'err_spam'), parse_mode='HTML', disable_web_page_preview=True)
         return
     last_activity[uid] = time.time()
     parent_thread_id = None
@@ -973,4 +958,6 @@ if __name__ == "__main__":
     threading.Thread(target=channel_stats_loop, args=(me.username,), daemon=True).start()
     threading.Thread(target=compact_loop, daemon=True).start()
     print("[start] Bot is running", flush=True)
+    if ADMINS:
+        print(f"[start] Admins loaded: {len(ADMINS)}", flush=True)
     bot.infinity_polling(timeout=30, long_polling_timeout=25, allowed_updates=['message', 'edited_message', 'message_reaction', 'callback_query'])
